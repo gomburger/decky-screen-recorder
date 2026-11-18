@@ -56,6 +56,106 @@ class Builders(unittest.TestCase):
             main.PREFS_FILE = prefs_file
             temp.cleanup()
 
+    def test_parse_range(self):
+        self.assertIsNone(main.parse_range(None, 1000))
+        self.assertEqual(main.parse_range("bytes=0-", 1000), (0, 999))
+        self.assertEqual(main.parse_range("bytes=100-199", 1000), (100, 199))
+        self.assertEqual(main.parse_range("bytes=900-5000", 1000), (900, 999))
+        self.assertEqual(main.parse_range("bytes=-100", 1000), (900, 999))
+        for bad in ("bytes=1000-", "bytes=5-2", "bytes=-"):
+            with self.assertRaises(ValueError, msg=bad):
+                main.parse_range(bad, 1000)
+
+    def test_recording_server(self):
+        """Serves only Recording_*.mp4 from the save folder, behind the token, with ranges."""
+        temp = tempfile.TemporaryDirectory()
+        output = main.OUTPUT_DIR
+        main.OUTPUT_DIR = temp.name
+        main.state = main.State()
+        data = bytes(range(256)) * 40
+        with open(os.path.join(temp.name, "Recording_20261119-120000_pw.mp4"), "wb") as file:
+            file.write(data)
+        with open(os.path.join(temp.name, "secret.txt"), "w") as file:
+            file.write("x")
+        server = main.RecordingServer()
+
+        async def get(path, extra=""):
+            base = await server.start()
+            port = int(base.split(":")[2].split("/")[0])
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(f"GET {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode())
+            await writer.drain()
+            response = await reader.read()
+            writer.close()
+            head, _, body = response.partition(b"\r\n\r\n")
+            return int(head.split()[1]), head.decode(), body
+
+        async def scenario():
+            token = server.token
+            name = "Recording_20261119-120000_pw.mp4"
+            results = [
+                await get(f"/{token}/{name}"),
+                await get(f"/{token}/{name}", "Range: bytes=10-19\r\n"),
+                await get(f"/{token}/{name}", "Range: bytes=99999-\r\n"),
+                await get(f"/wrong/{name}"),
+                await get(f"/{token}/secret.txt"),
+                await get(f"/{token}/..%2Fsecret.txt"),
+            ]
+            await server.stop()
+            return results
+
+        try:
+            full, part, unsatisfiable, wrong_token, other_file, traversal = asyncio.run(scenario())
+            self.assertEqual((full[0], full[2]), (200, data))
+            self.assertEqual((part[0], part[2]), (206, data[10:20]))
+            self.assertIn(f"Content-Range: bytes 10-19/{len(data)}", part[1])
+            self.assertEqual(unsatisfiable[0], 416)
+            self.assertEqual([wrong_token[0], other_file[0], traversal[0]], [404, 404, 404])
+            self.assertEqual([item["name"] for item in main.list_recordings()], ["Recording_20261119-120000_pw.mp4"])
+        finally:
+            main.OUTPUT_DIR = output
+            temp.cleanup()
+
+    def test_thumbnails_and_delete(self):
+        """A thumbnail and length are made on request, cached, pruned and deleted with the file."""
+        temp = tempfile.TemporaryDirectory()
+        output, settings = main.OUTPUT_DIR, main.SETTINGS_DIR
+        main.OUTPUT_DIR = os.path.join(temp.name, "videos")
+        main.SETTINGS_DIR = os.path.join(temp.name, "settings")
+        os.makedirs(main.OUTPUT_DIR)
+        main.state = main.State()
+        names = ["Recording_20261119-120000_pw.mp4", "Recording_20261119-120100_kms.mp4"]
+        for name in names:
+            subprocess.run(main.ffmpeg_base() + ["-f", "lavfi", "-i", "testsrc2=s=640x400:r=30:d=2",
+                                                 "-c:v", "libx264", "-preset", "ultrafast",
+                                                 os.path.join(main.OUTPUT_DIR, name)], check=True)
+        try:
+            path = main.find_recording(names[0])
+            jpeg, info = asyncio.run(main.ensure_thumbnail(path))
+            self.assertTrue(os.path.getsize(jpeg) > 0)
+            self.assertAlmostEqual(info["duration"], 2.0, delta=0.2)
+            # Cached: same file, no new work.
+            mtime = os.path.getmtime(jpeg)
+            self.assertEqual(asyncio.run(main.ensure_thumbnail(path))[0], jpeg)
+            self.assertEqual(os.path.getmtime(jpeg), mtime)
+            # A leftover from a recording that is gone is pruned.
+            stale = os.path.join(main.thumb_dir(), "Recording_old.1.1.jpg")
+            open(stale, "w").close()
+            main.prune_thumbnails(names)
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.exists(jpeg))
+            # Deleting removes the file and its cached thumbnail, only for recordings.
+            main.state.last_file = path
+            self.assertTrue(main.delete_recording(names[0]))
+            self.assertFalse(os.path.exists(path) or os.path.exists(jpeg))
+            self.assertEqual(main.state.last_file, "")
+            self.assertFalse(main.delete_recording("../settings/x.mp4"))
+            self.assertFalse(main.delete_recording(names[0]))
+            self.assertEqual([item["name"] for item in main.list_recordings()], [names[1]])
+        finally:
+            main.OUTPUT_DIR, main.SETTINGS_DIR = output, settings
+            temp.cleanup()
+
     def test_steam_bitrate_table(self):
         self.assertEqual(main.bitrate_for("preset_low", 800), 3750)
         self.assertEqual(main.bitrate_for("preset_default", 720), 7500)

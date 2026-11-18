@@ -9,10 +9,12 @@ sharing one ffmpeg between kmsgrab and PulseAudio dropped capture to ~17 fps.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import struct
@@ -474,6 +476,290 @@ def file_has_data(path):
         return os.path.getsize(path) > 0
     except OSError:
         return False
+
+
+# Playback in the panel: Steam's browser engine plays the MP4s, but a Steam page
+# cannot open local files, so the backend serves recordings over HTTP on
+# 127.0.0.1 only, behind a random token, and only Recording_*.mp4 files from the
+# save folders. Ranges are supported, or the player cannot seek.
+RECORDING_NAME_RE = re.compile(r"^Recording_[0-9A-Za-z_.-]+\.mp4$")
+RECORDING_LIST_LIMIT = 100
+SERVE_CHUNK = 256 * 1024
+REQUEST_LIMIT = 8192
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+# Album view: a frame from 20% into each recording (the first second is often the
+# Quick Access menu closing), made only when the list is opened and kept in the
+# settings folder with the recording's length, keyed by name, size and time.
+THUMB_WIDTH = 320
+THUMB_POSITION = 0.2
+THUMB_JOBS = 2
+THUMB_TIMEOUT_SEC = 20
+thumb_lock = None
+
+
+def thumb_dir():
+    return os.path.join(SETTINGS_DIR, "thumbnails")
+
+
+def thumb_paths(path):
+    """(jpeg, json) cache paths for a recording, changing when the file changes."""
+    info = os.stat(path)
+    key = f"{os.path.basename(path)[:-4]}.{info.st_size}.{int(info.st_mtime)}"
+    base = os.path.join(thumb_dir(), key)
+    return base + ".jpg", base + ".json"
+
+
+async def probe_duration(path):
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
+        env=clean_env(), stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), THUMB_TIMEOUT_SEC)
+        return float(output.strip())
+    except (asyncio.TimeoutError, ValueError):
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        return 0.0
+
+
+async def ensure_thumbnail(path):
+    """Make the thumbnail and length of a recording unless cached; return (jpeg, info)."""
+    global thumb_lock
+    if thumb_lock is None:
+        thumb_lock = asyncio.Semaphore(THUMB_JOBS)
+    jpeg, meta = thumb_paths(path)
+    async with thumb_lock:
+        if not (os.path.exists(jpeg) and os.path.exists(meta)):
+            os.makedirs(thumb_dir(), exist_ok=True)
+            duration = await probe_duration(path)
+            position = f"{duration * THUMB_POSITION:.2f}" if duration > 0 else "0"
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_base(), "-ss", position, "-i", path, "-frames:v", "1",
+                "-vf", f"scale={THUMB_WIDTH}:-2", "-q:v", "5", jpeg,
+                env=clean_env(), stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(process.wait(), THUMB_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+            with open(meta, "w", encoding="utf-8") as handle:
+                json.dump({"duration": round(duration, 2)}, handle)
+    try:
+        with open(meta, encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, ValueError):
+        info = {}
+    return (jpeg if os.path.exists(jpeg) else None), info
+
+
+def prune_thumbnails(names):
+    """Drop cached thumbnails of recordings that are gone or have changed."""
+    keep = set()
+    for name in names:
+        path = find_recording(name)
+        if path:
+            keep.update(os.path.basename(p) for p in thumb_paths(path))
+    try:
+        cached = os.listdir(thumb_dir())
+    except OSError:
+        return
+    for name in cached:
+        if name not in keep:
+            try:
+                os.remove(os.path.join(thumb_dir(), name))
+            except OSError:
+                pass
+
+
+def delete_recording(name):
+    """Delete a recording from the save folders; True if a file was removed."""
+    path = find_recording(name)
+    if path is None:
+        return False
+    try:
+        jpeg, meta = thumb_paths(path)
+        os.remove(path)
+    except OSError:
+        log.exception("could not delete %s", path)
+        return False
+    for cached in (jpeg, meta):
+        try:
+            os.remove(cached)
+        except OSError:
+            pass
+    if state.last_file == path:
+        state.last_file = ""
+    log.info("deleted %s", path)
+    return True
+
+
+def recording_folders():
+    return list(dict.fromkeys((output_dir(), OUTPUT_DIR)))
+
+
+def find_recording(name):
+    """Path of a recording by file name in the save folders, or None."""
+    if not RECORDING_NAME_RE.match(name or ""):
+        return None
+    for folder in recording_folders():
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def list_recordings():
+    """Recordings in the current save folder, newest first."""
+    folder = output_dir()
+    items = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return items
+    for name in names:
+        if not RECORDING_NAME_RE.match(name):
+            continue
+        try:
+            info = os.stat(os.path.join(folder, name))
+        except OSError:
+            continue
+        items.append({"name": name, "size": info.st_size, "mtime": int(info.st_mtime)})
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    return items[:RECORDING_LIST_LIMIT]
+
+
+def parse_range(header, size):
+    """(start, end) inclusive for a single "bytes=" range, None for the whole file.
+
+    Raises ValueError when the range cannot be satisfied.
+    """
+    match = RANGE_RE.match(header.strip()) if header else None
+    if not match or size == 0:
+        return None
+    first, last = match.groups()
+    if not first:
+        if not last:
+            raise ValueError(header)
+        start, end = max(size - int(last), 0), size - 1
+    else:
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+    if start >= size or start > end:
+        raise ValueError(header)
+    return start, end
+
+
+class RecordingServer:
+    """Serves recordings to the panel's player; started on first use."""
+
+    def __init__(self):
+        self.server = None
+        self.port = 0
+        self.token = secrets.token_urlsafe(16)
+
+    async def start(self):
+        if self.server is None:
+            self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
+            self.port = self.server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{self.port}/{self.token}/"
+
+    async def stop(self):
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+
+    async def handle(self, reader, writer):
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+            if len(head) > REQUEST_LIMIT:
+                return await self.reply(writer, 431)
+            lines = head.decode("latin-1").split("\r\n")
+            method, target, _ = (lines[0].split(" ") + ["", "", ""])[:3]
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip().lower()] = value.strip()
+            if method not in ("GET", "HEAD"):
+                return await self.reply(writer, 405)
+            parts = target.split("?", 1)[0].split("/")
+            if len(parts) not in (3, 4) or parts[0] or not hmac.compare_digest(parts[1], self.token):
+                return await self.reply(writer, 404)
+            kind = parts[2] if len(parts) == 4 else "video"
+            path = find_recording(parts[-1])
+            if path is None or kind not in ("video", "thumb", "meta"):
+                return await self.reply(writer, 404)
+            if kind == "video":
+                return await self.send_file(writer, path, headers.get("range"), method == "HEAD")
+            jpeg, info = await ensure_thumbnail(path)
+            if kind == "meta":
+                return await self.send_bytes(writer, json.dumps(info).encode(), "application/json")
+            if jpeg is None:
+                return await self.reply(writer, 404)
+            await self.send_file(writer, jpeg, None, method == "HEAD", "image/jpeg")
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError,
+                ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def reply(self, writer, status, extra=()):
+        reasons = {404: "Not Found", 405: "Method Not Allowed", 416: "Range Not Satisfiable",
+                   431: "Request Header Fields Too Large"}
+        lines = [f"HTTP/1.1 {status} {reasons.get(status, '')}", "Content-Length: 0", "Connection: close", *extra]
+        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+        await writer.drain()
+
+    async def send_bytes(self, writer, body, content_type):
+        # Read by fetch() from Steam's page, another origin; the token guards it.
+        lines = ["HTTP/1.1 200 OK", f"Content-Type: {content_type}", f"Content-Length: {len(body)}",
+                 "Access-Control-Allow-Origin: *", "Cache-Control: no-store", "Connection: close"]
+        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
+        await writer.drain()
+
+    async def send_file(self, writer, path, range_header, head_only, content_type="video/mp4"):
+        size = os.path.getsize(path)
+        try:
+            span = parse_range(range_header, size)
+        except ValueError:
+            return await self.reply(writer, 416, [f"Content-Range: bytes */{size}"])
+        start, end = span if span else (0, size - 1)
+        length = max(end - start + 1, 0)
+        lines = [
+            "HTTP/1.1 206 Partial Content" if span else "HTTP/1.1 200 OK",
+            f"Content-Type: {content_type}",
+            "Accept-Ranges: bytes",
+            f"Content-Length: {length}",
+            "Cache-Control: no-store",
+            "Connection: close",
+        ]
+        if span:
+            lines.append(f"Content-Range: bytes {start}-{end}/{size}")
+        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+        await writer.drain()
+        if head_only or length == 0:
+            return
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = await asyncio.to_thread(handle.read, min(SERVE_CHUNK, remaining))
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+                remaining -= len(chunk)
+
+
+recording_server = RecordingServer()
 
 
 class State:
@@ -1198,6 +1484,7 @@ class Plugin:
         asyncio.create_task(recover_leftovers())
 
     async def _unload(self):
+        await recording_server.stop()
         if state is not None:
             # Also keeps a running comparison from starting its next step.
             state.compare_cancel = True
@@ -1205,6 +1492,19 @@ class Plugin:
 
     async def get_state(self):
         return snapshot()
+
+    async def list_recordings(self):
+        """The save folder's recordings and the address the player loads them from.
+
+        Thumbnails are made only now, as the list asks for them; stale ones go.
+        """
+        items = list_recordings()
+        await asyncio.to_thread(prune_thumbnails, [item["name"] for item in items])
+        return {"base_url": await recording_server.start(), "items": items}
+
+    async def delete_recording(self, name):
+        deleted = isinstance(name, str) and await asyncio.to_thread(delete_recording, name)
+        return {"deleted": bool(deleted), "items": list_recordings()}
 
     async def clear_error(self):
         state.error = ""

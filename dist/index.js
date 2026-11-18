@@ -44,6 +44,8 @@ const startRecording = callable("start");
 const stopRecording = callable("stop");
 const startComparison = callable("compare");
 const setOutputDir = callable("set_output_dir");
+const listRecordings = callable("list_recordings");
+const deleteRecording = callable("delete_recording");
 // Decky's folder picker (FileSelectionType.FOLDER); missing on old Decky versions.
 const FOLDER_PICKER = 1;
 
@@ -120,6 +122,14 @@ const STRINGS = {
         "last": "Last recording",
         "folder.change": "Change Save Folder",
         "folder.default": "Use Default Folder",
+        "recordings": "Recordings",
+        "recordings.empty": "No recordings in the save folder yet",
+        "player.hint": "A play/pause · ◀ ▶ 5 seconds · L1/R1 previous/next · Y full screen · B back",
+        "player.fullscreen": "Full Screen",
+        "player.error": "Could not play this recording",
+        "delete": "Delete",
+        "delete.title": "Delete this recording?",
+        "delete.body": "{name} will be deleted from the device. This cannot be undone.",
         "err.output_invalid": "Can't save to that folder",
         "section.tools": "Tools",
         "compare": "Compare PipeWire and KMS",
@@ -185,6 +195,14 @@ const STRINGS = {
         "last": "최근 녹화",
         "folder.change": "저장 위치 변경",
         "folder.default": "기본 위치로 되돌리기",
+        "recordings": "녹화 목록",
+        "recordings.empty": "저장 위치에 녹화가 아직 없습니다",
+        "player.hint": "A 재생/일시정지 · ◀ ▶ 5초 이동 · L1/R1 이전/다음 · Y 전체 화면 · B 뒤로",
+        "player.fullscreen": "전체 화면",
+        "player.error": "이 녹화를 재생하지 못했습니다",
+        "delete": "삭제",
+        "delete.title": "이 녹화를 삭제할까요?",
+        "delete.body": "{name}을(를) 기기에서 삭제합니다. 되돌릴 수 없습니다.",
         "err.output_invalid": "그 폴더에는 저장할 수 없습니다",
         "section.tools": "도구",
         "compare": "PipeWire·KMS 비교 녹화",
@@ -669,7 +687,7 @@ function App() {
                 layout: "below",
                 bottomSeparator: "none",
                 disabled: !idle || !!s.compare_step,
-                onClick: () => api.openFilePicker(FOLDER_PICKER, s.output_dir, false, true)
+                onClick: () => fitFilePicker(api.openFilePicker(FOLDER_PICKER, s.output_dir, false, true))
                     .then((picked) => (picked?.realpath || picked?.path ? setOutputDir(picked.realpath || picked.path).then(setS) : null))
                     .catch(() => {}),
             }, t("folder.change"))) : null,
@@ -680,8 +698,309 @@ function App() {
                 disabled: !idle || !!s.compare_step,
                 onClick: () => setOutputDir("").then(setS).catch(() => {}),
             }, t("folder.default"))) : null,
+            // A modal hides the menu and the panel is built anew; as a "menu" slot
+            // the button gets focus back afterwards, like the dropdowns.
+            Row(h(Slot, { key: "recordings", id: "recordings", menu: true }, h(DFL.ButtonItem, {
+                layout: "below",
+                bottomSeparator: "none",
+                onClick: openRecordings,
+            }, t("recordings")))),
         )),
     );
+}
+
+// Recording list and player. The backend serves the files on 127.0.0.1 (Steam's
+// pages cannot open local files); Steam's browser engine plays the H.264/AAC MP4s.
+const SEEK_SECONDS = 5;
+
+function recordingLabel(item) {
+    // Recording_20261119-042029_kms.mp4 -> 2026-11-19 04:20:29 · KMS
+    const match = /^Recording_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})_(.+)\.mp4$/.exec(item.name);
+    if (!match) return item.name;
+    const [, y, mo, d, hh, mm, ss, kind] = match;
+    const method = { kms: "KMS", pw: "PipeWire" }[kind] ?? kind;
+    return `${y}-${mo}-${d} ${hh}:${mm}:${ss} · ${method}`;
+}
+
+function sizeLabel(bytes) {
+    return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+// Decky's folder picker is taller than game mode's screen (file list fixed at
+// 320 px, 560 px in all for 534): the path bar and "use this folder" were cut off.
+// While it is open from here, drop the modal's outer padding and shorten the list
+// by what still overflows (measured 2026-11-19: list 210 px, nothing cut off).
+const PICKER_FIT_ID = "screen-recorder-fit-list";
+// An attribute, not a class: Steam rewrites the list's class when focus enters
+// it ("gpfocuswithin"), which dropped a class and let the window grow again.
+const PICKER_FIT_ATTR = "data-screen-recorder-fit";
+const PICKER_WAIT_MS = 3000;
+
+function fitFilePicker(promise) {
+    const page = DFL.findSP?.()?.window?.document;
+    if (!page) return promise;
+    const started = Date.now();
+    const timer = setInterval(() => {
+        const picker = page.querySelector(".deckyFilePicker");
+        const list = picker && [...picker.querySelectorAll(".Panel")]
+            .find((element) => page.defaultView.getComputedStyle(element).overflowY === "scroll");
+        if (!list) {
+            if (Date.now() - started > PICKER_WAIT_MS) clearInterval(timer);
+            return;
+        }
+        clearInterval(timer);
+        let scroller = picker;
+        while (scroller && page.defaultView.getComputedStyle(scroller).overflowY !== "auto") scroller = scroller.parentElement;
+        if (!scroller) return;
+        scroller.style.paddingTop = "0px";
+        scroller.style.paddingBottom = "0px";
+        const over = scroller.scrollHeight - scroller.clientHeight;
+        if (over <= 0) return;
+        // !important wins over the list's own inline height (60vh).
+        let style = page.getElementById(PICKER_FIT_ID);
+        if (!style) {
+            style = page.createElement("style");
+            style.id = PICKER_FIT_ID;
+            page.head.appendChild(style);
+        }
+        const height = Math.max(Math.floor(list.getBoundingClientRect().height - over - 2), 120);
+        style.textContent = `[${PICKER_FIT_ATTR}] { height: ${height}px !important; }`;
+        list.setAttribute(PICKER_FIT_ATTR, "");
+    }, 100);
+    const stop = () => clearInterval(timer);
+    return promise.finally ? promise.finally(stop) : promise;
+}
+
+function openRecordings() {
+    listRecordings().then((data) => DFL.showModal(h(RecordingsModal, { data }))).catch(() => {});
+}
+
+function durationLabel(seconds) {
+    if (!(seconds > 0)) return "";
+    const total = Math.round(seconds);
+    const pad = (value) => String(value).padStart(2, "0");
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor(total / 60) % 60;
+    return hours ? `${hours}:${pad(minutes)}:${pad(total % 60)}` : `${minutes}:${pad(total % 60)}`;
+}
+
+// Asks first; resolves with the remaining items once the file is gone.
+function confirmDelete(item, onDeleted) {
+    DFL.showModal(h(DFL.ConfirmModal, {
+        strTitle: t("delete.title"),
+        strDescription: t("delete.body", { name: item.name }),
+        strOKButtonText: t("delete"),
+        onOK: () => deleteRecording(item.name).then((result) => onDeleted(result?.items)).catch(() => {}),
+    }));
+}
+
+// The Quick Access title class casts a dark 12 px shadow (for the panel header);
+// in a modal it darkened whatever sat under the title.
+const MODAL_TITLE = { marginBottom: "12px", boxShadow: "none" };
+
+const ALBUM_COLUMNS = 3;
+const ALBUM_CSS = `
+.sr-card { box-sizing: border-box; border-radius: 6px; padding: 4px; outline: 2px solid transparent; }
+.sr-card.gpfocus { outline-color: #ffffff; background: rgba(255, 255, 255, 0.08); }
+.sr-thumb { position: relative; aspect-ratio: 16 / 10; background: #23262e; border-radius: 4px; overflow: hidden; }
+.sr-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sr-duration { position: absolute; right: 4px; bottom: 4px; padding: 0 4px; border-radius: 3px;
+  background: rgba(0, 0, 0, 0.75); color: #fff; font-size: 11px; line-height: 16px; }
+.sr-caption { font-size: 12px; line-height: 16px; margin-top: 4px; color: #dcdedf; }
+.sr-caption span { color: #8b929a; }
+`;
+
+function AlbumCard({ item, baseUrl, onOpen, onDelete }) {
+    const [duration, setDuration] = useState(null);
+    const name = encodeURIComponent(item.name);
+    // The thumbnail request makes the frame and the length; then read the length.
+    const onLoad = () => fetch(`${baseUrl}meta/${name}`).then((r) => r.json())
+        .then((info) => setDuration(info?.duration)).catch(() => {});
+    const [date, method] = recordingLabel(item).split(" · ");
+    return h(DFL.Focusable, {
+        className: "sr-card",
+        // Three cards and two 12 px gaps fill the row exactly, so it stays centered.
+        style: { flex: `0 0 calc((100% - ${(ALBUM_COLUMNS - 1) * 12}px) / ${ALBUM_COLUMNS})` },
+        onActivate: onOpen,
+        onSecondaryButton: onDelete,
+        onSecondaryActionDescription: t("delete"),
+    },
+        h("div", { className: "sr-thumb" },
+            h("img", { src: `${baseUrl}thumb/${name}`, loading: "lazy", onLoad }),
+            duration ? h("div", { className: "sr-duration" }, durationLabel(duration)) : null),
+        h("div", { className: "sr-caption" }, date || item.name, h("br"),
+            h("span", null, [method, sizeLabel(item.size)].filter(Boolean).join(" · "))));
+}
+
+function RecordingsModal({ data, closeModal }) {
+    const [items, setItems] = useState(data?.items ?? []);
+    const baseUrl = data?.base_url ?? "";
+    const remove = (item) => confirmDelete(item, (left) => setItems(left ?? items.filter((i) => i.name !== item.name)));
+    const play = (item) => DFL.showModal(h(PlayerModal, {
+        items, baseUrl, index: items.indexOf(item), onDelete: remove,
+    }));
+    // Rows of cards, so up/down and left/right move like a grid.
+    const rows = [];
+    for (let i = 0; i < items.length; i += ALBUM_COLUMNS) rows.push(items.slice(i, i + ALBUM_COLUMNS));
+    return h(DFL.ModalRoot, { closeModal },
+        h("style", null, ALBUM_CSS),
+        h("div", { className: DFL.staticClasses.Title, style: MODAL_TITLE }, t("recordings")),
+        // Steam's footer already shows A, X and B; only an empty folder needs a line.
+        items.length ? null : h("div", { style: { ...NOTE, marginBottom: "10px" } }, t("recordings.empty")),
+        ...rows.map((row) => h(DFL.Focusable, {
+            key: row[0].name,
+            "flow-children": "row",
+            style: { display: "flex", gap: "12px", marginBottom: "12px" },
+        }, ...row.map((item) => h(AlbumCard, {
+            key: item.name, item, baseUrl,
+            onOpen: () => play(item),
+            onDelete: () => remove(item),
+        })))));
+}
+
+// Plays items[index]; L1 and R1 step to the previous and next recording in the
+// album's order (newest first), stopping at either end.
+function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }) {
+    const video = SP_REACT.useRef(null);
+    const holder = SP_REACT.useRef(null);
+    // Where to pick up after switching between the modal and the full window,
+    // which each have their own video element.
+    const resume = SP_REACT.useRef(null);
+    const [index, setIndex] = useState(startIndex);
+    const [failed, setFailed] = useState(false);
+    const [full, setFull] = useState(false);
+    const item = items[index];
+    const url = baseUrl + encodeURIComponent(item.name);
+    const step = (by) => {
+        const next = index + by;
+        if (next < 0 || next >= items.length) return;
+        setFailed(false);
+        setIndex(next);
+    };
+    const toggle = () => {
+        const element = video.current;
+        if (!element) return;
+        if (element.paused) element.play().catch(() => {});
+        else element.pause();
+    };
+    const seek = (seconds) => {
+        const element = video.current;
+        if (!element || !Number.isFinite(element.duration)) return;
+        element.currentTime = Math.min(Math.max(element.currentTime + seconds, 0), element.duration);
+    };
+    const onDirection = (event) => {
+        const button = event?.detail?.button;
+        if (button === DFL.GamepadButton.DIR_LEFT) seek(-SEEK_SECONDS);
+        else if (button === DFL.GamepadButton.DIR_RIGHT) seek(SEEK_SECONDS);
+        // Full screen: up and down go nowhere, so focus cannot slip to Delete.
+        else if (!full) return false;
+        return true;
+    };
+    const onButtonDown = (event) => {
+        const button = event?.detail?.button;
+        if (button === DFL.GamepadButton.BUMPER_LEFT) step(-1);
+        else if (button === DFL.GamepadButton.BUMPER_RIGHT) step(1);
+    };
+    // Y: the browser's fullscreen needs a real user gesture and refuses Steam's
+    // button events, so the player covers the whole Steam window instead.
+    const toggleFull = () => {
+        const element = video.current;
+        if (element) resume.current = { time: element.currentTime, paused: element.paused };
+        setFull((value) => !value);
+    };
+    const onCancel = (event) => {
+        if (!full) return false;
+        event?.stopPropagation?.();
+        toggleFull();
+        return true;
+    };
+    const onLoaded = () => {
+        const element = video.current;
+        const at = resume.current;
+        resume.current = null;
+        if (!element || !at) return;
+        element.currentTime = at.time;
+        if (at.paused) element.pause();
+    };
+    const renderVideo = (style) => h("video", {
+        key: `${full}-${url}`,
+        ref: video,
+        src: url,
+        autoPlay: true,
+        controls: true,
+        // The file is already on the device; Download only copied it to ~/Downloads.
+        // Picture-in-picture has no window to float in on game mode, and the
+        // fullscreen button is replaced by Y (full window).
+        controlsList: "nodownload nofullscreen",
+        disablePictureInPicture: true,
+        playsInline: true,
+        onError: () => setFailed(true),
+        onLoadedMetadata: onLoaded,
+        style: { background: "#000", display: "block", ...style },
+    });
+    const page = holder.current?.ownerDocument;
+    const remove = () => {
+        if (!onDelete) return;
+        closeModal?.();
+        onDelete(item);
+    };
+    // Let this modal reach from under the status bar to above the footer: Steam
+    // pads its scroller by 24 px top and bottom, which kept the box 48 px short
+    // (measured on game mode, 534 px tall: content 404 px instead of 356 px).
+    SP_REACT.useEffect(() => {
+        let scroller = holder.current;
+        while (scroller && scroller.ownerDocument.defaultView.getComputedStyle(scroller).overflowY !== "auto") {
+            scroller = scroller.parentElement;
+        }
+        if (!scroller) return undefined;
+        const saved = [scroller.style.paddingTop, scroller.style.paddingBottom];
+        scroller.style.paddingTop = "0px";
+        scroller.style.paddingBottom = "0px";
+        return () => {
+            [scroller.style.paddingTop, scroller.style.paddingBottom] = saved;
+        };
+    }, []);
+    // Stop loading when the modal goes away.
+    SP_REACT.useEffect(() => () => {
+        const element = video.current;
+        if (element) {
+            element.pause();
+            element.removeAttribute("src");
+            element.load();
+        }
+    }, []);
+    return h(DFL.ModalRoot, { closeModal },
+        h("div", { className: DFL.staticClasses.Title, style: { ...MODAL_TITLE, marginBottom: "6px", display: "flex", alignItems: "center", gap: "12px" } },
+            h("span", { style: { flex: "1 1 auto" } }, recordingLabel(item)),
+            h("span", { style: { color: "#8b929a", fontSize: "22px", fontVariantNumeric: "tabular-nums" } },
+                `${index + 1} / ${items.length}`)),
+        h(DFL.Focusable, {
+            onActivate: toggle,
+            onGamepadDirection: onDirection,
+            onButtonDown,
+            onOptionsButton: toggleFull,
+            onOptionsActionDescription: t("player.fullscreen"),
+            onSecondaryButton: full ? undefined : remove,
+            onSecondaryActionDescription: onDelete && !full ? t("delete") : undefined,
+            onCancelButton: onCancel,
+            noFocusRing: false,
+        }, h("div", { ref: holder },
+            // The modal grows with its content up to Steam's limit (452 px of 534
+            // here); the video gets what the title and the hint/delete row leave.
+            // A fixed height: a new video has no size until its metadata loads, and
+            // with only a maximum the modal shrank and grew back on L1/R1.
+            h("div", { style: { height: "calc(100vh - 222px)", background: "#000" } },
+                full ? null : renderVideo({ width: "100%", height: "100%", objectFit: "contain" })))),
+        full && page ? SP_REACTDOM.createPortal(h("div", {
+            style: { position: "fixed", inset: 0, zIndex: 10000, background: "#000", display: "flex", alignItems: "center", justifyContent: "center" },
+        }, renderVideo({ width: "100%", height: "100%", objectFit: "contain" })), page.body) : null,
+        h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", marginTop: "8px" } },
+            h("div", { style: NOTE }, failed ? t("player.error") : t("player.hint")),
+            // Not drawn while full, so focus cannot land on it there; X also deletes.
+            onDelete && !full ? h(DFL.DialogButton, {
+                style: { width: "auto", minWidth: "100px", flex: "0 0 auto" },
+                onClick: remove,
+            }, t("delete")) : null));
 }
 
 // A full-screen color test pattern over the Steam UI, to compare captures with
