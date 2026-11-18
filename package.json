@@ -1,0 +1,16 @@
+{
+  "name": "decky-screen-recorder",
+  "version": "0.9.0",
+  "description": "Record SteamOS game mode with KMS or PipeWire capture from the Quick Access menu",
+  "author": "gomburger",
+  "homepage": "https://github.com/gomburger/decky-screen-recorder#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gomburger/decky-screen-recorder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gomburger/decky-screen-recorder/issues"
+  },
+  "type": "module",
+  "license": "MIT"
+}

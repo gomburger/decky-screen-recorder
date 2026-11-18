@@ -1,0 +1,8 @@
+{
+  "name": "Screen Recorder",
+  "author": "gomburger",
+  "flags": [
+    "root"
+  ],
+  "api_version": 1
+}
