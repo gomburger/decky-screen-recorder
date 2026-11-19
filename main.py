@@ -611,6 +611,37 @@ def find_recording(name):
     return None
 
 
+def latest_recording(folder):
+    """The newest recording in folder, as a path, or "" when it has none."""
+    newest, newest_mtime = "", None
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if not RECORDING_NAME_RE.match(entry.name):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest, newest_mtime = entry.path, mtime
+    except OSError:
+        return ""
+    return newest
+
+
+def refresh_latest(items=None):
+    """Looks for the newest recording again; only when it can have changed.
+
+    items, when given, is what list_recordings just returned (newest first), so
+    the folder is not read a second time.
+    """
+    if items is None:
+        state.latest_file = latest_recording(output_dir())
+    else:
+        state.latest_file = os.path.join(output_dir(), items[0]["name"]) if items else ""
+
+
 def list_recordings():
     """Recordings in the current save folder, newest first."""
     folder = output_dir()
@@ -769,6 +800,11 @@ class State:
         self.error_detail = ""
         self.error_count = 0
         self.last_file = ""
+        # The newest recording in the save folder, for the panel's last recording
+        # row. Looked up at start, after a save, a delete or a folder change and
+        # when the list opens, not on every poll. A list opened while saving can
+        # pick the file still being muxed; the lookup after the save corrects it.
+        self.latest_file = ""
         self.finished = 0
         self.prefs = {
             # PipeWire by default: it needs no forced composition or display changes.
@@ -1005,6 +1041,7 @@ def snapshot():
         "error_detail": state.error_detail,
         "error_count": state.error_count,
         "last_file": state.last_file,
+        "latest_file": state.latest_file,
         "finished": state.finished,
         "prefs": state.prefs,
         "preview_kbps": {str(h): bitrate_for(preset, h, state.prefs["custom_mbps"]) for h in (800, 1080)},
@@ -1391,6 +1428,7 @@ async def finish_recording(error=""):
             log.exception("save failed")
             fail("save_failed", f"{mux_error} ({work_dir})")
         state.reset_capture()
+        refresh_latest()
         state.status = "idle"
 
 
@@ -1472,6 +1510,7 @@ async def recover_leftovers():
                     log.exception("could not recover %s", work_dir)
                     fail("save_failed", f"{error} ({work_dir})")
         finally:
+            refresh_latest()
             state.status = "idle"
 
 
@@ -1480,6 +1519,7 @@ class Plugin:
         global state
         state = State()
         load_prefs()
+        refresh_latest()
         await restore_after_crash()
         asyncio.create_task(recover_leftovers())
 
@@ -1499,12 +1539,15 @@ class Plugin:
         Thumbnails are made only now, as the list asks for them; stale ones go.
         """
         items = list_recordings()
+        refresh_latest(items)
         await asyncio.to_thread(prune_thumbnails, [item["name"] for item in items])
         return {"base_url": await recording_server.start(), "items": items}
 
     async def delete_recording(self, name):
         deleted = isinstance(name, str) and await asyncio.to_thread(delete_recording, name)
-        return {"deleted": bool(deleted), "items": list_recordings()}
+        items = list_recordings()
+        refresh_latest(items)
+        return {"deleted": bool(deleted), "items": items}
 
     async def clear_error(self):
         state.error = ""
@@ -1571,6 +1614,7 @@ class Plugin:
                 return snapshot()
         state.prefs["output_dir"] = path if path != OUTPUT_DIR else ""
         save_prefs()
+        refresh_latest()
         return snapshot()
 
     async def set_kms_original_color(self, enabled):

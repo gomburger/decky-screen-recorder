@@ -156,6 +156,39 @@ class Builders(unittest.TestCase):
             main.OUTPUT_DIR, main.SETTINGS_DIR = output, settings
             temp.cleanup()
 
+    def test_latest_recording(self):
+        """The newest recording in the save folder, looked up only when asked to."""
+        temp = tempfile.TemporaryDirectory()
+        output = main.OUTPUT_DIR
+        main.OUTPUT_DIR = temp.name
+        main.state = main.State()
+        try:
+            self.assertEqual(main.latest_recording(temp.name), "")
+            self.assertEqual(main.latest_recording(os.path.join(temp.name, "missing")), "")
+            paths = [os.path.join(temp.name, name) for name in
+                     ("Recording_20261119-120000_pw.mp4", "Recording_20261119-120100_kms.mp4", "other.mp4")]
+            for n, path in enumerate(paths):
+                open(path, "w").close()
+                os.utime(path, (1000 + n, 1000 + n))
+            # other.mp4 is newest but not a recording.
+            self.assertEqual(main.latest_recording(temp.name), paths[1])
+            # A poll does not look at the folder; a refresh does.
+            self.assertEqual(main.snapshot()["latest_file"], "")
+            main.refresh_latest()
+            self.assertEqual(main.snapshot()["latest_file"], paths[1])
+            os.remove(paths[1])
+            self.assertEqual(main.snapshot()["latest_file"], paths[1])
+            main.refresh_latest()
+            self.assertEqual(main.snapshot()["latest_file"], paths[0])
+            # From a list already read: its first item, or none for an empty list.
+            main.refresh_latest([])
+            self.assertEqual(main.snapshot()["latest_file"], "")
+            main.refresh_latest(main.list_recordings())
+            self.assertEqual(main.snapshot()["latest_file"], paths[0])
+        finally:
+            main.OUTPUT_DIR = output
+            temp.cleanup()
+
     def test_steam_bitrate_table(self):
         self.assertEqual(main.bitrate_for("preset_low", 800), 3750)
         self.assertEqual(main.bitrate_for("preset_default", 720), 7500)

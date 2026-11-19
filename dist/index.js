@@ -252,8 +252,16 @@ function Note({ color, children }) {
     return h("div", { style: { ...NOTE, ...(color ? { color } : {}) } }, children);
 }
 
-function OptionNote({ divider, children }) {
-    return h("div", { style: { ...NOTE, ...(divider ? { paddingBottom: "12px", borderBottom: "1px solid rgba(255, 255, 255, 0.12)" } : {}) } }, children);
+// Steam's color for a disabled Field's description (read from its stylesheet,
+// 2026-11-19); a note under a disabled dropdown matches the toggles' own lines.
+const DISABLED_NOTE_COLOR = "rgb(103, 112, 123)";
+
+function OptionNote({ divider, disabled, children }) {
+    return h("div", { style: {
+        ...NOTE,
+        ...(disabled ? { color: DISABLED_NOTE_COLOR } : {}),
+        ...(divider ? { paddingBottom: "12px", borderBottom: "1px solid rgba(255, 255, 255, 0.12)" } : {}),
+    } }, children);
 }
 
 function Chevron({ up }) {
@@ -323,22 +331,42 @@ let topGroupElement = null;
 // so the page opened as far down as the list had been scrolled to reach it
 // (measured 2026-11-19: 78 px, the status card half hidden).
 let panelTop = null;
-const PANEL_TOP_RESET_MS = [0, 60, 300];
-
+// Once, at 0 ms, was enough (also in Hangul IME Bridge, user confirmed).
 function resetPanelScroll() {
-    const timers = PANEL_TOP_RESET_MS.map((delay) => setTimeout(() => {
+    const timer = setTimeout(() => {
         // Leave it if Steam has put focus on a row below the status card.
         const focused = panelTop?.parentElement?.querySelector(".gpfocus");
         if (focused && !focused.closest(`[${SCROLL_EDGE_ATTR}="top"]`)) return;
         const scroller = findScroller(panelTop);
         if (scroller) scroller.scrollTop = 0;
-    }, delay));
-    return () => timers.forEach(clearTimeout);
+    }, 0);
+    return () => clearTimeout(timer);
+}
+
+// B closing a dropdown or a modal reaches the panel once more as it shows again
+// (32 and 43 ms after it, measured 2026-11-19), and Decky took it as Back to the
+// plugin list. It is dropped as Steam's vgp_oncancel DOM event on the panel's
+// div, not with a Focusable around the panel: an extra nav node there changes
+// where Steam puts focus back after a modal (AdGuard VPN 0.8.2).
+const echoGuarded = new WeakSet();
+
+function dropEchoedBack(event) {
+    if (Date.now() - panelShownAt >= MENU_ECHO_MS) return;
+    // What a Focusable's onCancelButton does when it handles the button.
+    event.stopPropagation();
+    event.preventDefault();
+}
+
+function panelRef(element) {
+    panelTop = element;
+    if (element && !echoGuarded.has(element)) {
+        echoGuarded.add(element);
+        element.addEventListener("vgp_oncancel", dropEchoedBack);
+    }
 }
 
 function ScrollPanel(...children) {
-    return h(DFL.Focusable, { "flow-children": "column" },
-        h("div", { ref: (element) => { panelTop = element; } }), ...children);
+    return h("div", { ref: panelRef }, ...children);
 }
 
 // The status card and the record button: focus here shows the top of the panel.
@@ -356,9 +384,11 @@ function TopGroup(...children) {
     }, ...children));
 }
 
-// The saved info and its buttons: Steam scrolls them into view as usual.
+// The saved info and its buttons, with no Focusable around them: as a group,
+// Steam put focus back on its first row after the recordings modal instead of
+// the button that opened it (measured 2026-11-20).
 function ScrollGroup(...children) {
-    return h(DFL.Focusable, { "flow-children": "column" }, ...children);
+    return h(SP_REACT.Fragment, null, ...children);
 }
 
 // The Quick Access menu builds the panel anew each time it opens, and Steam puts
@@ -385,13 +415,26 @@ function saveToolsOpen(open) {
     }
 }
 
-// A dropdown's menu hides the Quick Access menu, and the panel is taken down and
-// built anew about 1.5 to 2 s after the menu shows again; Steam then focuses
-// something else. The dropdown takes focus back once the page shows.
+// A dropdown's menu or a modal hides the Quick Access menu, and the panel is taken
+// down and built anew; Steam then focuses something else. The control that opened
+// it takes focus back once the page shows.
 let menuOpenId = null;
 let menuOpenedAt = 0;
+// Where the panel was scrolled when that menu or modal opened. The rebuilt panel
+// starts at the top; it goes back here before it is first drawn, so it does not
+// show the top and then jump.
+let menuScrollTop = null;
+
+function markMenuOpen(id) {
+    menuOpenId = id;
+    menuOpenedAt = Date.now();
+    menuScrollTop = findScroller(slotElements[id])?.scrollTop ?? null;
+}
 const MENU_RETURN_MS = 60000;
-const FOCUS_SETTLE_MS = [60, 300];
+// Steam itself puts focus back on the opener as the page shows (2 ms after it,
+// measured 2026-11-20, once no Focusable wrapped the panel or the saved group);
+// this one try is a fallback and changes nothing then.
+const FOCUS_SETTLE_MS = 20;
 // The press that closes a dropdown's menu reaches the panel once more as it shows
 // again; on the dropdown it would open the menu again. No hand presses that soon.
 let menuReturnedAt = 0;
@@ -403,6 +446,45 @@ const MENU_ECHO_MS = 150;
 let panelShownAt = 0;
 const RECORD_GUARD_MS = 150;
 const slotElements = {};
+
+// The A that opens a dropdown or a modal can reach it once more as it appears and
+// press what it focused first (closing the menu on its current choice, pausing the
+// player). As in AdGuard VPN 0.8.2: an A within 150 ms of the menu or modal
+// appearing is dropped, caught first in the page it is drawn in. B and touch are
+// left alone; the B that closes one is handled on the panel's side.
+let modalShownAt = 0;
+const OPEN_ECHO_MS = 150;
+const OPEN_GUARD_MS = 1500;
+
+function markModalShown() {
+    modalShownAt = Date.now();
+}
+
+function guardOpenEcho() {
+    let page;
+    try {
+        page = DFL.findSP?.()?.document;
+    }
+    catch {
+        page = null;
+    }
+    if (!page) return;
+    modalShownAt = Date.now();
+    const dropEcho = (event) => {
+        if (Date.now() - modalShownAt >= OPEN_ECHO_MS) return;
+        event.stopPropagation();
+        event.preventDefault();
+    };
+    page.addEventListener("vgp_onok", dropEcho, true);
+    // Long enough for the menu or modal to appear; the check above does the timing.
+    setTimeout(() => page.removeEventListener("vgp_onok", dropEcho, true), OPEN_GUARD_MS);
+}
+
+// Steam's ConfirmModal; this notes when it appears and passes everything on.
+function GuardedConfirmModal(props) {
+    useEffect(markModalShown, []);
+    return h(DFL.ConfirmModal, props);
+}
 
 // Give focus the way the controller would, through the navigation node Steam keeps
 // for the element: a browser focus moves the highlight, but not where the next
@@ -423,15 +505,32 @@ function takeSteamFocus(element) {
     target.focus?.();
 }
 
+// The rebuilt panel starts at the top. Steam scrolls to a row only when focus
+// moves to it; when Steam has already put focus back on this row by position,
+// TakeFocus changes nothing and the row stayed out of sight (measured
+// 2026-11-19: scrollTop 0 after TakeFocus on the focused row, 546 when focus
+// came from the record button).
+function showInPanel(element) {
+    const scroller = findScroller(element);
+    if (!element || !scroller) return;
+    const box = element.getBoundingClientRect();
+    const view = scroller.getBoundingClientRect();
+    if (box.top >= view.top && box.bottom <= view.bottom) return;
+    element.scrollIntoView({ block: "center", behavior: "auto" });
+}
+
 // Once the page shows, Steam picks where focus goes; this comes just after it.
 function focusOnceShown(element) {
     const page = element?.ownerDocument;
     if (!page) return undefined;
-    const timers = [];
+    let timer = null;
     const focusSoon = () => {
         menuReturnedAt = Date.now();
         panelShownAt = Date.now();
-        for (const delay of FOCUS_SETTLE_MS) timers.push(setTimeout(() => takeSteamFocus(element), delay));
+        timer = setTimeout(() => {
+            takeSteamFocus(element);
+            showInPanel(element);
+        }, FOCUS_SETTLE_MS);
     };
     const onShown = () => {
         if (page.visibilityState !== "visible") return;
@@ -442,7 +541,7 @@ function focusOnceShown(element) {
     else page.addEventListener("visibilitychange", onShown);
     return () => {
         page.removeEventListener("visibilitychange", onShown);
-        timers.forEach(clearTimeout);
+        clearTimeout(timer);
     };
 }
 
@@ -456,8 +555,8 @@ function Slot({ id, menu, children }) {
             event.preventDefault();
             return;
         }
-        menuOpenId = id;
-        menuOpenedAt = Date.now();
+        markMenuOpen(id);
+        guardOpenEcho();
     } : undefined;
     return h("div", { ref: (element) => { slotElements[id] = element; }, onClickCapture }, children);
 }
@@ -532,13 +631,21 @@ function App() {
         return () => page.removeEventListener("visibilitychange", onVisibility);
     }, []);
 
-    // Built anew after a dropdown's menu: hand focus back to that dropdown.
+    // Built anew after a menu or modal: back to where the panel was scrolled,
+    // before it is drawn (layout effects run before the focus effect below).
+    SP_REACT.useLayoutEffect(() => {
+        const recent = menuOpenId && Date.now() - menuOpenedAt < MENU_RETURN_MS;
+        const scroller = findScroller(panelTop);
+        if (recent && scroller && menuScrollTop !== null) scroller.scrollTop = menuScrollTop;
+    }, []);
+    // Built anew after a menu or modal: hand focus back to what opened it.
     useEffect(() => {
         const id = menuOpenId;
         const recent = id && Date.now() - menuOpenedAt < MENU_RETURN_MS;
         menuOpenId = null;
         menuOpenedAt = 0;
-        // Back from a dropdown's menu: that dropdown takes focus and scrolls to it.
+        menuScrollTop = null;
+        // Back from a menu or modal: the opener takes focus and is shown.
         return recent ? focusOnceShown(slotElements[id]) : resetPanelScroll();
     }, []);
 
@@ -617,7 +724,7 @@ function App() {
                 selectedOption: method,
                 onChange: (option) => choose(setMethod, option.data),
             }))),
-            Row(h(OptionNote, { divider: true }, t(`method.${method}.note`))),
+            Row(h(OptionNote, { divider: true, disabled: !idle }, t(`method.${method}.note`))),
             // Hidden where the backend has nothing to change (unknown vibrancy range).
             method === "kms" && s.original_color ? Row(h(Slot, { id: "original" }, h(DFL.ToggleField, {
                 label: t("original.label"),
@@ -647,7 +754,7 @@ function App() {
                 valueSuffix: " Mbps",
                 onChange: changeCustomMbps,
             }))) : null,
-            Row(h(OptionNote, { divider: true }, custom
+            Row(h(OptionNote, { divider: true, disabled: !idle }, custom
                 ? t("bitrate.custom.note", { rate: s.prefs.custom_mbps })
                 : t("bitrate", { rate: mbps(s.preview_kbps["800"]), rate1080: mbps(s.preview_kbps["1080"]) }))),
             Row(h(Slot, { id: "fps", menu: true }, h(DFL.DropdownItem, {
@@ -658,7 +765,7 @@ function App() {
                 selectedOption: s.prefs.fps,
                 onChange: (option) => choose(setFps, option.data),
             }))),
-            Row(h(OptionNote, { divider: true }, t("fps.note"))),
+            Row(h(OptionNote, { divider: true, disabled: !idle }, t("fps.note"))),
             Row(h(Slot, { id: "mic" }, h(DFL.ToggleField, {
                 label: t("mic"),
                 // Mic off: this is the last setting, and its line sits above the tools button.
@@ -683,7 +790,7 @@ function App() {
                 checked: s.prefs.mic_mode === "separate",
                 onChange: (enabled) => setMicMode(enabled ? "separate" : "mix").then(setS),
             }))) : null,
-            s.prefs.mic ? Row(h(OptionNote, { divider: true }, t(`mic.note.${s.prefs.mic_mode}`))) : null,
+            s.prefs.mic ? Row(h(OptionNote, { divider: true, disabled: !idle }, t(`mic.note.${s.prefs.mic_mode}`))) : null,
             // The tools stay in the settings section, with no section gap above them.
             // The button folds them away.
             // The line under the button only closes the folded section.
@@ -701,27 +808,29 @@ function App() {
                         DFL.Navigation?.CloseSideMenus?.();
                     },
                 }, t("compare"))),
-                Row(h(OptionNote, { divider: true }, t("compare.note"))),
+                Row(h(OptionNote, { divider: true, disabled: !idle || !!s.compare_step }, t("compare.note"))),
                 Row(h(DFL.ButtonItem, { layout: "below", bottomSeparator: "none", onClick: showTestPattern }, t("pattern"))),
                 Row(h(OptionNote, { divider: true }, t("pattern.note"))),
             ) : null,
         ),
         h(DFL.PanelSection, { title: t("section.saved") }, ScrollGroup(
-            s.last_file ? InfoRow({ key: "last" },
-                h(Note, null, t("last")),
-                h("div", { style: FILE_NAME }, basename(s.last_file))) : null,
             InfoRow({ key: "folder" },
                 h(Note, null, s.output_dir),
                 s.free_gb !== null ? h(Note, null, t("free", { gb: s.free_gb })) : null),
-            api.openFilePicker ? Row(h(DFL.ButtonItem, {
-                key: "change",
+            // The picker is a modal too. Browsing can outlast MENU_RETURN_MS, so
+            // the return is marked again when it closes, keeping the first scroll.
+            api.openFilePicker ? Row(h(Slot, { key: "change", id: "change", menu: true }, h(DFL.ButtonItem, {
                 layout: "below",
                 bottomSeparator: "none",
                 disabled: !idle || !!s.compare_step,
                 onClick: () => fitFilePicker(api.openFilePicker(FOLDER_PICKER, s.output_dir, false, true))
+                    .finally(() => {
+                        if (menuOpenId !== "change") return;
+                        menuOpenedAt = Date.now();
+                    })
                     .then((picked) => (picked?.realpath || picked?.path ? setOutputDir(picked.realpath || picked.path).then(setS) : null))
                     .catch(() => {}),
-            }, t("folder.change"))) : null,
+            }, t("folder.change")))) : null,
             s.output_dir_custom ? Row(h(DFL.ButtonItem, {
                 key: "default",
                 layout: "below",
@@ -729,6 +838,19 @@ function App() {
                 disabled: !idle || !!s.compare_step,
                 onClick: () => setOutputDir("").then(setS).catch(() => {}),
             }, t("folder.default"))) : null,
+            // Opens the player on this recording; A on a Field may also arrive as a
+            // click, so the second call within a moment is dropped.
+            // The newest recording in the save folder, also after a restart.
+            s.latest_file ? Row(h(Slot, { key: "last", id: "last" }, h(DFL.Field, {
+                focusable: true,
+                childrenLayout: "below",
+                childrenContainerWidth: "max",
+                bottomSeparator: "none",
+                onActivate: () => openLastRecording(s.latest_file),
+                onClick: () => openLastRecording(s.latest_file),
+            },
+                h(Note, null, t("last")),
+                h("div", { style: FILE_NAME }, basename(s.latest_file))))) : null,
             // A modal hides the menu and the panel is built anew; as a "menu" slot
             // the button gets focus back afterwards, like the dropdowns.
             Row(h(Slot, { key: "recordings", id: "recordings", menu: true }, h(DFL.ButtonItem, {
@@ -803,7 +925,36 @@ function fitFilePicker(promise) {
 }
 
 function openRecordings() {
-    listRecordings().then((data) => DFL.showModal(h(RecordingsModal, { data }))).catch(() => {});
+    listRecordings().then((data) => {
+        guardOpenEcho();
+        DFL.showModal(h(RecordingsModal, { data }));
+    }).catch(() => {});
+}
+
+// The player straight away, with the whole list for L1/R1. A recording that is
+// no longer in the save folder (deleted, or the folder changed) opens the list.
+let lastOpenAt = 0;
+const LAST_OPEN_DEDUPE_MS = 500;
+
+function openLastRecording(path) {
+    const at = Date.now();
+    if (at - lastOpenAt < LAST_OPEN_DEDUPE_MS || at - menuReturnedAt < MENU_ECHO_MS) return;
+    lastOpenAt = at;
+    // Focus comes back to this row when the panel is rebuilt after the modal.
+    markMenuOpen("last");
+    listRecordings().then((data) => {
+        const items = data?.items ?? [];
+        const index = items.findIndex((item) => item.name === basename(path));
+        guardOpenEcho();
+        if (index < 0) {
+            DFL.showModal(h(RecordingsModal, { data }));
+            return;
+        }
+        DFL.showModal(h(PlayerModal, {
+            items, baseUrl: data.base_url ?? "", index,
+            onDelete: (item) => confirmDelete(item, () => {}),
+        }));
+    }).catch(() => {});
 }
 
 function durationLabel(seconds) {
@@ -817,7 +968,8 @@ function durationLabel(seconds) {
 
 // Asks first; resolves with the remaining items once the file is gone.
 function confirmDelete(item, onDeleted) {
-    DFL.showModal(h(DFL.ConfirmModal, {
+    guardOpenEcho();
+    DFL.showModal(h(GuardedConfirmModal, {
         strTitle: t("delete.title"),
         strDescription: t("delete.body", { name: item.name }),
         strOKButtonText: t("delete"),
@@ -867,9 +1019,11 @@ function RecordingsModal({ data, closeModal }) {
     const [items, setItems] = useState(data?.items ?? []);
     const baseUrl = data?.base_url ?? "";
     const remove = (item) => confirmDelete(item, (left) => setItems(left ?? items.filter((i) => i.name !== item.name)));
-    const play = (item) => DFL.showModal(h(PlayerModal, {
-        items, baseUrl, index: items.indexOf(item), onDelete: remove,
-    }));
+    const play = (item) => {
+        guardOpenEcho();
+        DFL.showModal(h(PlayerModal, { items, baseUrl, index: items.indexOf(item), onDelete: remove }));
+    };
+    useEffect(markModalShown, []);
     // Rows of cards, so up/down and left/right move like a grid.
     const rows = [];
     for (let i = 0; i < items.length; i += ALBUM_COLUMNS) rows.push(items.slice(i, i + ALBUM_COLUMNS));
@@ -892,6 +1046,7 @@ function RecordingsModal({ data, closeModal }) {
 // Plays items[index]; L1 and R1 step to the previous and next recording in the
 // album's order (newest first), stopping at either end.
 function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }) {
+    useEffect(markModalShown, []);
     const video = SP_REACT.useRef(null);
     const holder = SP_REACT.useRef(null);
     const slot = SP_REACT.useRef(null);
