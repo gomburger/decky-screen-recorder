@@ -90,7 +90,7 @@ const STRINGS = {
         "method": "Capture Method",
         "method.kms": "KMS",
         "method.pw": "PipeWire",
-        "method.kms.note": "Everything on screen, including MangoHud\nDisplay color settings are applied to the recording",
+        "method.kms.note": "Everything on screen, including the mouse cursor and overlays\nDisplay color settings are applied to the recording",
         "method.pw.note": "Game, Steam UI, Quick Access menu and notifications",
         "original.label": "Record Original Colors",
         "original.note": "While recording, turns off mura correction, sets color vibrancy to Native, uses the native color temperature and turns off night mode. The screen looks more vivid and panel unevenness may show",
@@ -124,7 +124,7 @@ const STRINGS = {
         "folder.default": "Use Default Folder",
         "recordings": "Recordings",
         "recordings.empty": "No recordings in the save folder yet",
-        "player.hint": "A play/pause · ◀ ▶ 5 seconds · L1/R1 previous/next · Y full screen · B back",
+        "player.hint": "A Play/Pause · ◀ ▶ 5 Seconds · L1/R1 Previous/Next · Y Full Screen · B Back",
         "player.fullscreen": "Full Screen",
         "player.error": "Could not play this recording",
         "delete": "Delete",
@@ -163,7 +163,7 @@ const STRINGS = {
         "method": "캡처 방식",
         "method.kms": "KMS",
         "method.pw": "PipeWire",
-        "method.kms.note": "MangoHud까지 화면 전체 녹화\n디스플레이 색상 설정이 녹화에 반영됩니다",
+        "method.kms.note": "마우스 커서와 오버레이 포함 화면 전체 녹화\n디스플레이 색상 설정이 녹화에 반영됩니다",
         "method.pw.note": "게임, Steam UI, 빠른 메뉴, 알림 녹화",
         "original.label": "원본 색으로 녹화",
         "original.note": "녹화 중에만 무라 보정을 끄고 채도를 Native로, 색온도를 기본으로 바꾸며 야간 모드를 끕니다. 그동안 화면 색이 진해지고 패널 얼룩이 보일 수 있습니다",
@@ -279,16 +279,30 @@ function InfoRow(props, ...children) {
     }, ...children));
 }
 
-// Steam scrolls to a newly focused item smoothly unless it is far away, so after a
-// few quick presses the scrolling trails the focus and hides it. Steam Fields also
-// scroll themselves into view (smoothly) after any handler below them, so the
-// panel takes over all focus scrolling with "force" and decides what to show:
-// the row that holds the focus, the whole saved info group, or, for the record
-// button, the top of the panel with the status card.
-const SCROLL_TOP_CLASS = "screen-recorder-scroll-top";
-
-function nodeElement(node) {
-    return node?.Element ?? node?.m_element;
+// Steam scrolls a newly focused row into view smoothly on its own. The top group
+// (status card, record button) scrolls to the very top instead, smoothly, so the
+// card is never cut off. Steam's own scroll must stay out of that group: it can
+// cancel a smooth scroll and jump at once when the target is far away (measured
+// 2026-11-19: 251 -> 805 in one step). "force" with a handler makes Steam call
+// only this handler there. No second call after 150 ms (Hangul IME Bridge 1.2.5
+// needs one without "force"): here it restarted the smooth scroll near the end
+// and dragged out the last 30 px for another 200 ms.
+const SCROLL_EDGE_ATTR = "data-screen-recorder-scroll";
+// Pinned top while recording, over the Quick Access panel's own background.
+// Decky's title bar is transparent and lies over the first ~50 px of the
+// scroller, so the pinned block reaches up to the scroller's top edge (padding
+// as tall as its resting offset, the same amount of negative margin) and covers
+// what scrolls behind the title too.
+function pinnedTopStyle(offset) {
+    return {
+        position: "sticky",
+        top: 0,
+        zIndex: 3,
+        paddingTop: `${offset}px`,
+        marginTop: `${-offset}px`,
+        background: "rgb(14, 20, 27)",
+        boxShadow: "0 6px 8px -6px rgba(0, 0, 0, 0.6)",
+    };
 }
 
 // The element that scrolls the Quick Access panel.
@@ -301,28 +315,9 @@ function findScroller(element) {
     return null;
 }
 
-function scrollPanelTo(focused, previous, panel) {
-    const scroller = findScroller(nodeElement(focused));
-    // Show the largest navigation node around the focus that still fits on screen:
-    // a row's Field or a group, never a whole section taller than the panel.
-    let target = focused;
-    for (let node = focused.Parent; node && node !== panel; node = node.Parent) {
-        const element = nodeElement(node);
-        if (!element) continue;
-        if (element.classList?.contains(SCROLL_TOP_CLASS)) {
-            if (scroller) {
-                scroller.scrollTop = 0;
-                return true;
-            }
-            target = node;
-            break;
-        }
-        if (scroller && element.getBoundingClientRect().height > scroller.clientHeight) break;
-        target = node;
-    }
-    nodeElement(target)?.scrollIntoView?.({ behavior: "auto", block: "nearest" });
-    return true;
-}
+// A plain div carries the marker: Steam rewrites the class of its focusable
+// nodes when focus moves, but leaves this div alone.
+let topGroupElement = null;
 
 // Decky's plugin list and a plugin's page share the Quick Access tab's scroller,
 // so the page opened as far down as the list had been scrolled to reach it
@@ -334,7 +329,7 @@ function resetPanelScroll() {
     const timers = PANEL_TOP_RESET_MS.map((delay) => setTimeout(() => {
         // Leave it if Steam has put focus on a row below the status card.
         const focused = panelTop?.parentElement?.querySelector(".gpfocus");
-        if (focused && !focused.closest(`.${SCROLL_TOP_CLASS}`)) return;
+        if (focused && !focused.closest(`[${SCROLL_EDGE_ATTR}="top"]`)) return;
         const scroller = findScroller(panelTop);
         if (scroller) scroller.scrollTop = 0;
     }, delay));
@@ -342,19 +337,26 @@ function resetPanelScroll() {
 }
 
 function ScrollPanel(...children) {
-    return h(DFL.Focusable, {
-        "flow-children": "column",
-        scrollIntoViewWhenChildFocused: "force",
-        fnScrollIntoViewHandler: scrollPanelTo,
-    }, h("div", { ref: (element) => { panelTop = element; } }), ...children);
+    return h(DFL.Focusable, { "flow-children": "column" },
+        h("div", { ref: (element) => { panelTop = element; } }), ...children);
 }
 
 // The status card and the record button: focus here shows the top of the panel.
 function TopGroup(...children) {
-    return h(DFL.Focusable, { "flow-children": "column", className: SCROLL_TOP_CLASS }, ...children);
+    return h("div", {
+        [SCROLL_EDGE_ATTR]: "top",
+        ref: (element) => { topGroupElement = element; },
+    }, h(DFL.Focusable, {
+        "flow-children": "column",
+        scrollIntoViewWhenChildFocused: "force",
+        fnScrollIntoViewHandler: () => {
+            findScroller(topGroupElement)?.scrollTo({ top: 0, behavior: "smooth" });
+            return true;
+        },
+    }, ...children));
 }
 
-// The saved info: focus here shows all of it.
+// The saved info and its buttons: Steam scrolls them into view as usual.
 function ScrollGroup(...children) {
     return h(DFL.Focusable, { "flow-children": "column" }, ...children);
 }
@@ -467,9 +469,13 @@ function App() {
         // When the backend measured elapsed, so the timer can run on between polls.
         next.received_at = Date.now();
         cachedState = next;
+        notifyListIcon(next);
         setState(next);
     }, []);
     const [now, setNow] = useState(Date.now());
+    const pinnedTop = SP_REACT.useRef(null);
+    // Where the top block rests below the scroller's top edge, measured unpinned.
+    const [pinOffset, setPinOffset] = useState(null);
     const [toolsOpen, setToolsOpen] = useState(loadToolsOpen);
     const toggleTools = useCallback(() => setToolsOpen((open) => {
         saveToolsOpen(!open);
@@ -481,6 +487,28 @@ function App() {
         const timer = setInterval(() => setNow(Date.now()), TICK_MS);
         return () => clearInterval(timer);
     }, [capturing]);
+    useEffect(() => {
+        if (!capturing) {
+            setPinOffset(null);
+            return;
+        }
+        if (pinOffset !== null) return;
+        const element = pinnedTop.current;
+        const scroller = findScroller(element);
+        if (!element || !scroller) return;
+        const top = element.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+        setPinOffset(Math.max(Math.round(top), 0));
+    }, [capturing, pinOffset]);
+    // Rows Steam scrolls into view must not end up under the pinned top: the
+    // scroller's scroll-padding-top keeps them below it.
+    useEffect(() => {
+        const element = pinnedTop.current;
+        const scroller = findScroller(element);
+        if (pinOffset === null || !scroller) return undefined;
+        const saved = scroller.style.scrollPaddingTop;
+        scroller.style.scrollPaddingTop = `${element.offsetHeight}px`;
+        return () => { scroller.style.scrollPaddingTop = saved; };
+    }, [pinOffset, s?.error]);
 
     const refresh = useCallback(() => getState().then((next) => {
         if (next.status !== "idle") watchRecording();
@@ -556,7 +584,10 @@ function App() {
     const accent = capturing ? RECORDING_COLOR : IDLE_COLOR;
 
     return ScrollPanel(
-        h(DFL.PanelSection, null, TopGroup(
+        // While recording, the status card and the stop button stay pinned at the
+        // top of the panel; the rest scrolls under them.
+        h("div", { ref: pinnedTop, style: capturing && pinOffset !== null ? pinnedTopStyle(pinOffset) : undefined },
+            h(DFL.PanelSection, null, TopGroup(
             Row(h("div", { style: { ...CARD, background: capturing ? "rgba(255, 107, 107, 0.15)" : "rgba(255, 255, 255, 0.06)" } },
                 h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },
                     h("div", { style: { ...DOT, background: accent } }),
@@ -576,7 +607,7 @@ function App() {
                 t(capturing ? "action.stop" : "action.start")))),
             s.error ? Row(h(Note, { color: ERROR_COLOR }, t(`err.${s.error}`) + (s.error_detail ? ` (${s.error_detail})` : ""))) : null,
             s.error ? Row(h(DFL.ButtonItem, { layout: "below", onClick: () => clearError().then(setS) }, t("dismiss"))) : null,
-        )),
+        ))),
         h(DFL.PanelSection, { title: t("section.settings") },
             Row(h(Slot, { id: "method", menu: true }, h(DFL.DropdownItem, {
                 label: t("method"),
@@ -863,9 +894,15 @@ function RecordingsModal({ data, closeModal }) {
 function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }) {
     const video = SP_REACT.useRef(null);
     const holder = SP_REACT.useRef(null);
-    // Where to pick up after switching between the modal and the full window,
-    // which each have their own video element.
-    const resume = SP_REACT.useRef(null);
+    const slot = SP_REACT.useRef(null);
+    const fullSlot = SP_REACT.useRef(null);
+    // One video element for both the modal and the full window: it lives in this
+    // box, and the box moves between the two. A new element for each place had to
+    // load the file again, which showed black frames on every Y.
+    const [box, setBox] = useState(null);
+    // The recording whose picture is on screen. After L1/R1 the last one stays on
+    // top, paused, until the next one has its first frame, instead of black.
+    const [shown, setShown] = useState(null);
     const [index, setIndex] = useState(startIndex);
     const [failed, setFailed] = useState(false);
     const [full, setFull] = useState(false);
@@ -875,6 +912,7 @@ function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }
         const next = index + by;
         if (next < 0 || next >= items.length) return;
         setFailed(false);
+        video.current?.pause();
         setIndex(next);
     };
     const toggle = () => {
@@ -903,27 +941,23 @@ function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }
     };
     // Y: the browser's fullscreen needs a real user gesture and refuses Steam's
     // button events, so the player covers the whole Steam window instead.
-    const toggleFull = () => {
-        const element = video.current;
-        if (element) resume.current = { time: element.currentTime, paused: element.paused };
-        setFull((value) => !value);
-    };
+    const toggleFull = () => setFull((value) => !value);
     const onCancel = (event) => {
         if (!full) return false;
         event?.stopPropagation?.();
         toggleFull();
         return true;
     };
-    const onLoaded = () => {
-        const element = video.current;
-        const at = resume.current;
-        resume.current = null;
-        if (!element || !at) return;
-        element.currentTime = at.time;
-        if (at.paused) element.pause();
-    };
-    const renderVideo = (style) => h("video", {
-        key: `${full}-${url}`,
+    const frameReady = () => setShown(url);
+    const previous = shown && shown !== url ? h("video", {
+        key: shown,
+        src: shown,
+        muted: true,
+        playsInline: true,
+        style: { position: "absolute", inset: 0, zIndex: 1, width: "100%", height: "100%", objectFit: "contain", background: "#000" },
+    }) : null;
+    const renderVideo = () => [previous, h("video", {
+        key: url,
         ref: video,
         src: url,
         autoPlay: true,
@@ -934,10 +968,10 @@ function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }
         controlsList: "nodownload nofullscreen",
         disablePictureInPicture: true,
         playsInline: true,
-        onError: () => setFailed(true),
-        onLoadedMetadata: onLoaded,
-        style: { background: "#000", display: "block", ...style },
-    });
+        onLoadedData: frameReady,
+        onError: () => { setFailed(true); frameReady(); },
+        style: { background: "#000", display: "block", width: "100%", height: "100%", objectFit: "contain" },
+    })];
     const page = holder.current?.ownerDocument;
     const remove = () => {
         if (!onDelete) return;
@@ -960,15 +994,29 @@ function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }
             [scroller.style.paddingTop, scroller.style.paddingBottom] = saved;
         };
     }, []);
-    // Stop loading when the modal goes away.
-    SP_REACT.useEffect(() => () => {
-        const element = video.current;
-        if (element) {
+    SP_REACT.useLayoutEffect(() => {
+        const element = holder.current.ownerDocument.createElement("div");
+        element.style.width = "100%";
+        element.style.height = "100%";
+        element.style.position = "relative";
+        setBox(element);
+    }, []);
+    // Moved in one step (appendChild), so the video keeps playing: the browser
+    // pauses a media element only when it is still out of the page afterwards.
+    SP_REACT.useLayoutEffect(() => {
+        const target = full ? fullSlot.current : slot.current;
+        if (box && target && box.parentNode !== target) target.appendChild(box);
+    }, [box, full, page]);
+    // Stop loading when the modal goes away. A layout cleanup runs before React
+    // takes the videos out of the box (and clears the video ref); a plain
+    // effect's cleanup would find neither.
+    SP_REACT.useLayoutEffect(() => () => {
+        box?.querySelectorAll("video").forEach((element) => {
             element.pause();
             element.removeAttribute("src");
             element.load();
-        }
-    }, []);
+        });
+    }, [box]);
     return h(DFL.ModalRoot, { closeModal },
         h("div", { className: DFL.staticClasses.Title, style: { ...MODAL_TITLE, marginBottom: "6px", display: "flex", alignItems: "center", gap: "12px" } },
             h("span", { style: { flex: "1 1 auto" } }, recordingLabel(item)),
@@ -989,16 +1037,20 @@ function PlayerModal({ items, index: startIndex, baseUrl, onDelete, closeModal }
             // here); the video gets what the title and the hint/delete row leave.
             // A fixed height: a new video has no size until its metadata loads, and
             // with only a maximum the modal shrank and grew back on L1/R1.
-            h("div", { style: { height: "calc(100vh - 222px)", background: "#000" } },
-                full ? null : renderVideo({ width: "100%", height: "100%", objectFit: "contain" })))),
-        full && page ? SP_REACTDOM.createPortal(h("div", {
-            style: { position: "fixed", inset: 0, zIndex: 10000, background: "#000", display: "flex", alignItems: "center", justifyContent: "center" },
-        }, renderVideo({ width: "100%", height: "100%", objectFit: "contain" })), page.body) : null,
+            h("div", { ref: slot, style: { height: "calc(100vh - 222px)", background: "#000" } }))),
+        box ? SP_REACTDOM.createPortal(renderVideo(), box) : null,
+        // Kept in the page and only hidden, so the box never leaves the document.
+        page ? SP_REACTDOM.createPortal(h("div", {
+            ref: fullSlot,
+            style: { position: "fixed", inset: 0, zIndex: 10000, background: "#000", display: full ? "block" : "none" },
+        }), page.body) : null,
         h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", marginTop: "8px" } },
             h("div", { style: NOTE }, failed ? t("player.error") : t("player.hint")),
-            // Not drawn while full, so focus cannot land on it there; X also deletes.
-            onDelete && !full ? h(DFL.DialogButton, {
-                style: { width: "auto", minWidth: "100px", flex: "0 0 auto" },
+            // Hidden but kept while full: removing it shortened the modal, which
+            // moved the video up and down while Steam's focus ring stayed where it
+            // was. Up and down are blocked while full, so focus cannot reach it.
+            onDelete ? h(DFL.DialogButton, {
+                style: { width: "auto", minWidth: "100px", flex: "0 0 auto", visibility: full ? "hidden" : "visible" },
                 onClick: remove,
             }, t("delete")) : null));
 }
@@ -1074,6 +1126,26 @@ function RecordIcon() {
         h("circle", { cx: 12, cy: 12, r: 5 }));
 }
 
+// The icon in Decky's plugin list turns red while recording. Each time the list
+// appears it asks for the state, and the panel and the recording watcher tell
+// it right away when the state changes.
+const listIconListeners = new Set();
+
+function notifyListIcon(state) {
+    const capturing = !!(state && state.capturing);
+    listIconListeners.forEach((listener) => listener(capturing));
+}
+
+function PluginListIcon() {
+    const [capturing, setCapturing] = useState(!!cachedState?.capturing);
+    useEffect(() => {
+        listIconListeners.add(setCapturing);
+        getState().then(notifyListIcon).catch(() => {});
+        return () => { listIconListeners.delete(setCapturing); };
+    }, []);
+    return h("span", { style: { display: "flex", color: capturing ? RECORDING_COLOR : undefined } }, h(RecordIcon, null));
+}
+
 function toast(title, body) {
     const toaster = api.toaster || DFL.toaster;
     toaster?.toast?.({ title, body });
@@ -1112,6 +1184,7 @@ function checkRecording() {
             if (saved) toast(t("toast.saved"), basename(s.last_file));
             if (failed) toast(t("toast.failed"), t(`err.${s.error}`));
         }
+        notifyListIcon(s);
         seenFinished = s.finished;
         seenErrorCount = s.error_count;
         if (s.status !== "idle" || s.compare_step) {
@@ -1214,9 +1287,8 @@ var index = DFL.definePlugin(() => {
     watchDisplaySettings();
     return {
         name: manifest.name,
-        titleView: h("div", { className: DFL.staticClasses.Title }, manifest.name),
         content: h(App, null),
-        icon: h(RecordIcon, null),
+        icon: h(PluginListIcon, null),
         onDismount() {
             stopWatching();
             settingsRegistration?.unregister?.();
