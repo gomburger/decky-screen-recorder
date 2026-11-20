@@ -5,6 +5,8 @@ so it never opens the gamescope stream that can crash a running game.
 """
 
 import asyncio
+import functools
+import json
 import os
 import pathlib
 import shutil
@@ -25,8 +27,38 @@ def synthetic_video(output, kbps, fps=60):
     ] + main.encode_args(kbps, fps) + [output]
 
 
+@functools.lru_cache(maxsize=None)
+def rgb10_swapped():
+    """Whether this system's Vulkan upload swaps red and blue of x2rgb10, as main.rgb10_order finds."""
+    output = subprocess.run(main.rgb10_check_cmd(), capture_output=True).stdout
+    order = main.rgb10_order_from(output[:4])
+    assert order, "10-bit RGB does not reach libplacebo here"
+    return order == "swapped"
+
+
 def synthetic_audio(_sink, output):
     return main.ffmpeg_base() + ["-re", "-f", "lavfi", "-i", "sine"] + main.AUDIO_ARGS + [output]
+
+
+def hdr_edid(max_code, eotfs=0b101):
+    """A 256-byte EDID whose CTA block holds HDR static metadata with that max code."""
+    data = bytearray(256)
+    block = bytearray(128)
+    block[0], block[1], block[2] = 0x02, 0x03, 4 + 7
+    block[4:11] = bytes([(7 << 5) | 6, 6, eotfs, 0x01, max_code, max_code, 0])
+    data[128:] = block
+    return bytes(data)
+
+
+def panel_edid(vendor, product, model="", hdr=True):
+    """An EDID with a base block naming the panel, and HDR (PQ, ~1000 nits) if asked."""
+    data = bytearray(hdr_edid(139) if hdr else bytes(256))
+    data[:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+    code = sum((ord(letter) - 64) << shift for letter, shift in zip(vendor, (10, 5, 0)))
+    data[8], data[9], data[10], data[11] = code >> 8, code & 255, product & 255, product >> 8
+    data[54:59] = b"\x00\x00\x00\xfc\x00"
+    data[59:72] = (model + "\n").ljust(13).encode()[:13]
+    return bytes(data)
 
 
 class Builders(unittest.TestCase):
@@ -207,9 +239,63 @@ class Builders(unittest.TestCase):
         self.assertTrue(video_filter.startswith("hwmap=derive_device=vaapi,"))
         self.assertIn("hwdownload,format=nv12,hwupload", video_filter)
         self.assertIn("vulkan=vk", command)
-        self.assertIn("contrast=1.37:saturation=1.1", video_filter)
+        self.assertNotIn("saturation", video_filter)
+        # The copy written for the recording, never the template or the save folder.
+        self.assertIn(f"custom_shader_path={os.path.join(main.SETTINGS_DIR, main.DECK_SHADER_NAME)}", video_filter)
         self.assertIn("color_primaries=bt2020", video_filter)
         self.assertIn("h264_vulkan", command)
+
+    def test_hdr_command_rgb10(self):
+        """The shader modes take 10-bit RGB; the plain mode stays on NV12."""
+        for mode in main.HDR_SHADER_MODES:
+            command = main.kms_hdr_cmd("v.mkv", 1, 60, mode, rgb10=True)
+            video_filter = command[command.index("-vf") + 1]
+            self.assertIn(f"{main.HDR_RGB10_DOWNLOAD_FILTER},hwupload,", video_filter, mode)
+            self.assertIn("colorspace=gbr", video_filter, mode)
+            self.assertNotIn("format=nv12,hwupload", video_filter, mode)
+            # 10-bit needs no debanding; the NV12 fallback gets it.
+            self.assertNotIn("deband", video_filter, mode)
+            command = main.kms_hdr_cmd("v.mkv", 1, 60, mode)
+            self.assertIn(main.DEBAND, command[command.index("-vf") + 1], mode)
+        plain = main.kms_hdr_cmd("v.mkv", 1, 60, "plain", rgb10=True)
+        self.assertIn("hwdownload,format=nv12,hwupload", plain[plain.index("-vf") + 1])
+        self.assertIn(main.DEBAND, plain[plain.index("-vf") + 1])
+
+    def test_rgb10_order(self):
+        self.assertEqual(main.rgb10_order_from(bytes((253, 1, 0, 255))), "ok")
+        self.assertEqual(main.rgb10_order_from(bytes((0, 2, 251, 255))), "swapped")
+        self.assertEqual(main.rgb10_order_from(bytes((120, 120, 120, 255))), "")
+        self.assertEqual(main.rgb10_order_from(b""), "")
+        # Whatever this system does, the shader puts red back where it was.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        main.write_deck_shader(1000, 304.5, temp.name, swap_rb=rgb10_swapped())
+        shader = os.path.join(temp.name, main.DECK_SHADER_NAME)
+        with open(shader, encoding="utf-8") as file:
+            self.assertEqual("//!HOOK RGB" in file.read(), rgb10_swapped())
+
+        def convert(rgb, rgb10):
+            if rgb10:
+                upload = f"format=x2rgb10le,hwupload,{main.rgb_input(main.HDR_INPUT_FILTER)}"
+            else:
+                upload = f"scale=out_color_matrix=bt709:out_range=pc,format=nv12,hwupload,{main.HDR_INPUT_FILTER}"
+            source = "color=c=0x{:02x}{:02x}{:02x}:s=64x64:d=1,format=rgb24".format(*rgb)
+            result = subprocess.run(main.ffmpeg_base() + [
+                "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk", "-f", "lavfi", "-i", source,
+                "-frames:v", "1", "-vf",
+                f"{upload},{main.deck_tonemap_filter(shader)},hwdownload,format=nv12,"
+                "scale=in_range=tv:in_color_matrix=bt709:out_range=pc,format=rgb24",
+                "-f", "rawvideo", "-"], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr[-300:])
+            at = (32 * 64 + 32) * 3
+            return tuple(result.stdout[at:at + 3])
+
+        main.write_deck_shader(1000, 304.5, temp.name)
+        reference = [convert(rgb, False) for rgb in ((200, 40, 20), (30, 60, 200))]
+        main.write_deck_shader(1000, 304.5, temp.name, swap_rb=rgb10_swapped())
+        for rgb, expected in zip(((200, 40, 20), (30, 60, 200)), reference):
+            got = convert(rgb, True)
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(got, expected)), 6, (rgb, got, expected))
 
     def test_kms_sdr_filter_keeps_the_curve(self):
         """scale_vaapi gets no transfer or primaries (they lifted midtones); tags come from setparams."""
@@ -220,7 +306,8 @@ class Builders(unittest.TestCase):
 
     def test_hdr_modes(self):
         deck = main.kms_hdr_cmd("v.mkv", 1)
-        self.assertIn("contrast=1.37", deck[deck.index("-vf") + 1])
+        self.assertIn(main.DECK_SHADER_NAME, deck[deck.index("-vf") + 1])
+        self.assertTrue(os.path.isfile(main.DECK_SHADER))
         for mode in ("plain", "external"):
             command = main.kms_hdr_cmd("v.mkv", 1, 60, mode)
             video_filter = command[command.index("-vf") + 1]
@@ -259,14 +346,18 @@ class Builders(unittest.TestCase):
             y = (nits / 10000) ** m1
             return ((c1 + c2 * y) / (1 + c3 * y)) ** m2
 
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        main.write_pq_shader(480, temp.name, swap_rb=rgb10_swapped())
+        shader = os.path.join(temp.name, main.SHADER_NAME)
         for nits, expected in ((10, 44), (100, 125), (203, 173), (400, 234), (1000, 255)):
             value = round(pq(nits) * 255)
             source = f"color=c=0x{value:02x}{value:02x}{value:02x}:s=64x64:d=1,format=rgb24"
             command = main.ffmpeg_base() + [
                 "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk", "-f", "lavfi", "-i", source,
                 "-frames:v", "1", "-vf",
-                f"scale=out_color_matrix=bt709:out_range=pc,format=nv12,hwupload,{main.HDR_PQ_INPUT_FILTER},"
-                f"{main.pq_tonemap_filter(main.PQ_SHADER)},hwdownload,format=nv12,"
+                f"format=x2rgb10le,hwupload,{main.rgb_input(main.HDR_PQ_INPUT_FILTER)},"
+                f"{main.pq_tonemap_filter(shader)},hwdownload,format=nv12,"
                 "scale=in_range=tv:in_color_matrix=bt709:out_range=pc,format=gray",
                 "-f", "rawvideo", "-",
             ]
@@ -274,6 +365,184 @@ class Builders(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr[-300:])
             # within the 8-bit PQ input steps and the limited-range round trip
             self.assertLessEqual(abs(result.stdout[32 * 64 + 32] - expected), 4, nits)
+
+    def test_external_hdr_game_rolls_off_highlights(self):
+        """External HDR10 with the brightness settings: white at 1.5 x paper white, rolled off to the peak."""
+        m1, m2, c1, c2, c3 = 2610 / 16384, 2523 / 32, 3424 / 4096, 2413 / 128, 2392 / 128
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        main.write_pq_shader(main.hdr_white_nits(1000, 203), temp.name, peak_nits=1000, swap_rb=rgb10_swapped())
+        shader = os.path.join(temp.name, main.SHADER_NAME)
+
+        def pq(nits):
+            y = (nits / 10000) ** m1
+            return round(((c1 + c2 * y) / (1 + c3 * y)) ** m2 * 255)
+
+        def convert(rgb):
+            source = "color=c=0x{:02x}{:02x}{:02x}:s=64x64:d=1,format=rgb24".format(*rgb)
+            command = main.ffmpeg_base() + [
+                "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk", "-f", "lavfi", "-i", source,
+                "-frames:v", "1", "-vf",
+                f"format=x2rgb10le,hwupload,{main.rgb_input(main.HDR_PQ_INPUT_FILTER)},"
+                f"{main.pq_tonemap_filter(shader)},hwdownload,format=nv12,"
+                "scale=in_range=tv:in_color_matrix=bt709:out_range=pc,format=rgb24",
+                "-f", "rawvideo", "-",
+            ]
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr[-300:])
+            at = (32 * 64 + 32) * 3
+            return tuple(result.stdout[at:at + 3])
+
+        grays = [convert((pq(nits),) * 3)[1] for nits in (100, 203, 400, 600, 1000)]
+        self.assertEqual(grays, sorted(grays))
+        # 203 nits near 84 % (214), within the 8-bit PQ input steps; 1000 at white.
+        self.assertLessEqual(abs(grays[1] - 214), 6)
+        self.assertGreaterEqual(grays[-1], 250)
+        self.assertGreater(grays[-1], grays[-2])
+
+    def test_deck_hdr_rolls_off_highlights(self):
+        """Gamma 2.2 up to 1000 nits: white at 1.5 x paper white, highlights rolled off to the peak, hue kept."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        shader = os.path.join(temp.name, main.DECK_SHADER_NAME)
+
+        def use(peak, paper_white):
+            main.write_deck_shader(peak, main.hdr_white_nits(peak, paper_white), temp.name, swap_rb=rgb10_swapped())
+
+        def encode(nits):
+            return round((nits / 1000) ** (1 / 2.2) * 255)
+
+        def convert(rgb):
+            source = "color=c=0x{:02x}{:02x}{:02x}:s=64x64:d=1,format=rgb24".format(*rgb)
+            command = main.ffmpeg_base() + [
+                "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk", "-f", "lavfi", "-i", source,
+                "-frames:v", "1", "-vf",
+                f"format=x2rgb10le,hwupload,{main.rgb_input(main.HDR_INPUT_FILTER)},"
+                f"{main.deck_tonemap_filter(shader)},hwdownload,format=nv12,"
+                "scale=in_range=tv:in_color_matrix=bt709:out_range=pc,format=rgb24",
+                "-f", "rawvideo", "-",
+            ]
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr[-300:])
+            at = (32 * 64 + 32) * 3
+            return tuple(result.stdout[at:at + 3])
+
+        # The defaults: peak 1000, paper white 203, so white at 304.5 nits.
+        use(1000, main.DEFAULT_PAPER_WHITE)
+        # Gamma 2.2 below the knee (~160 nits), measured 2026-11-21 with a 300-nit white.
+        for nits, expected in ((10, 52), (50, 110), (100, 153), (150, 185)):
+            self.assertLessEqual(abs(convert((encode(nits),) * 3)[1] - expected), 3, nits)
+        # Above it brighter still comes out brighter, up to white at 1000 nits.
+        highs = [convert((encode(nits),) * 3)[1] for nits in (400, 600, 1000)]
+        self.assertEqual(highs, sorted(highs))
+        self.assertGreaterEqual(highs[-1], 250)
+        # Orange at 900 nits stays orange; clipping per channel made it yellow (224).
+        red, green, blue = convert((encode(900), encode(400), 0))
+        self.assertGreaterEqual(red, 250)
+        self.assertLess(green, 185)
+        # A game set to a 600-nit peak: 600 already reaches white, brighter is cut there.
+        use(600, 203)
+        at_peak = convert((encode(600),) * 3)[1]
+        self.assertGreaterEqual(at_peak, 252)
+        self.assertLess(convert((encode(400),) * 3)[1], at_peak)
+        self.assertEqual(convert((encode(1000),) * 3)[1], at_peak)
+        # A brighter paper white records the same gray darker.
+        use(1000, 300)
+        self.assertLess(convert((encode(100),) * 3)[1], 140)
+
+    def test_display_hdr_peak_from_edid(self):
+        self.assertAlmostEqual(main.edid_hdr_peak(hdr_edid(139)), 1015.2, places=1)
+        self.assertIsNone(main.edid_hdr_peak(hdr_edid(139, eotfs=0b011)))
+        self.assertIsNone(main.edid_hdr_peak(bytes(128)))
+        self.assertEqual(main.round_peak(1015.2), 1000)
+        self.assertEqual(main.round_peak(603.7), 600)
+        self.assertEqual(main.round_peak(746.0), 750)
+        self.assertEqual(main.round_peak(1450.0), 1450)
+
+    def test_hdr_brightness_settings(self):
+        self.assertEqual(main.hdr_white_nits(1000, 203), 304.5)
+        # Never above the peak: with nothing left to roll off, the peak is white.
+        self.assertEqual(main.hdr_white_nits(400, 400), 400)
+        self.assertEqual(main.PAPER_WHITES, [203, 300])
+        self.assertEqual(main.DEFAULT_PAPER_WHITE, 203)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        main.write_deck_shader(600, 304.5, temp.name)
+        with open(os.path.join(temp.name, main.DECK_SHADER_NAME)) as file:
+            text = file.read()
+        self.assertIn("const float peak_nits = 600.0;", text)
+        self.assertIn("const float white_nits = 304.5;", text)
+        self.assertIn("const float panel_nits = 1000.0;", text)
+        main.write_deck_shader(600, 304.5, temp.name, panel_nits=687.448)
+        with open(os.path.join(temp.name, main.DECK_SHADER_NAME)) as file:
+            self.assertIn("const float panel_nits = 687.4;", file.read())
+        # Saved values are checked on load like the other settings.
+        settings, prefs_file, state = main.SETTINGS_DIR, main.PREFS_FILE, main.state
+        try:
+            main.SETTINGS_DIR = temp.name
+            main.PREFS_FILE = os.path.join(temp.name, "prefs.json")
+            main.state = main.State()
+            # None follows the display's peak; a value needs the top it was chosen under.
+            for saved, peak, paper in (({"hdr_peak": 800, "hdr_peak_top": 1000, "hdr_paper_white": 203}, 800, 203),
+                                       ({"hdr_peak": 800, "hdr_paper_white": 203}, None, 203),
+                                       ({"hdr_peak": 805, "hdr_paper_white": 205}, None, 203),
+                                       ({"hdr_peak": 20000, "hdr_paper_white": "x"}, None, 203),
+                                       ({"hdr_paper_white": 300}, None, 300),
+                                       # A slider value from a test build.
+                                       ({"hdr_paper_white": 250}, None, 203),
+                                       ({"hdr_peak": True}, None, 203)):
+                main.state = main.State()
+                with open(main.PREFS_FILE, "w") as file:
+                    json.dump(saved, file)
+                main.load_prefs()
+                self.assertEqual((main.state.prefs["hdr_peak"], main.state.prefs["hdr_paper_white"]), (peak, paper), saved)
+            plugin = main.Plugin()
+            main.state = main.State()
+            # Deck OLED's panel with gamescope's EDID (1000 nits).
+            edid = os.path.join(temp.name, "edid.bin")
+            with open(edid, "wb") as file:
+                file.write(hdr_edid(139))
+            originals = main.GAMESCOPE_EDID, main.external_display, main.DECK_PANEL
+            main.GAMESCOPE_EDID, main.external_display, main.DECK_PANEL = edid, lambda: False, "oled"
+            self.addCleanup(lambda: setattr(main, "GAMESCOPE_EDID", originals[0]))
+            self.addCleanup(lambda: setattr(main, "external_display", originals[1]))
+            self.addCleanup(lambda: setattr(main, "DECK_PANEL", originals[2]))
+            self.assertEqual(main.hdr_peak(), 1000)
+            asyncio.run(plugin.set_hdr_peak(734))
+            self.assertEqual((main.state.prefs["hdr_peak"], main.state.prefs["hdr_peak_top"]), (730, 1000))
+            self.assertEqual(main.hdr_peak(), 730)
+            # The top itself follows the display.
+            asyncio.run(plugin.set_hdr_peak(5000))
+            self.assertEqual((main.state.prefs["hdr_peak"], main.hdr_peak()), (None, 1000))
+            asyncio.run(plugin.set_hdr_peak(500))
+            asyncio.run(plugin.set_hdr_paper_white(300))
+            self.assertEqual(main.state.prefs["hdr_paper_white"], 300)
+            asyncio.run(plugin.set_hdr_paper_white(250))
+            self.assertEqual(main.state.prefs["hdr_paper_white"], 300)
+            asyncio.run(plugin.set_hdr_paper_white(203))
+            self.assertEqual(main.state.prefs["hdr_paper_white"], 203)
+            snap = main.snapshot()
+            self.assertEqual(snap["paper_whites"], main.PAPER_WHITES)
+            self.assertEqual(snap["hdr_peak_range"], [400, 1000])
+            self.assertTrue(snap["hdr_settings"])
+            # An external 600-nit HDR monitor: the range ends there, and the 500 chosen
+            # under a 1000-nit top goes back to following the top.
+            with open(edid, "wb") as file:
+                file.write(hdr_edid(115))
+            os.utime(edid, ns=(1, 1))
+            main.external_display = lambda: True
+            snap = main.snapshot()
+            self.assertEqual((snap["hdr_peak_range"], snap["hdr_peak"], snap["hdr_settings"]), ([400, 600], 600, True))
+            self.assertIsNone(main.state.prefs["hdr_peak"])
+            with open(main.PREFS_FILE) as file:
+                self.assertIsNone(json.load(file)["hdr_peak"])
+            # A monitor without PQ: no HDR, so the settings are not offered.
+            with open(edid, "wb") as file:
+                file.write(hdr_edid(115, eotfs=0b001))
+            os.utime(edid, ns=(2, 2))
+            self.assertFalse(main.snapshot()["hdr_settings"])
+        finally:
+            main.SETTINGS_DIR, main.PREFS_FILE, main.state = settings, prefs_file, state
 
     def test_external_display_detection(self):
         temp = tempfile.TemporaryDirectory()
@@ -290,23 +559,112 @@ class Builders(unittest.TestCase):
             connector("card0-Writeback-1", "enabled")
             self.assertEqual(main.hdr_mode(), "deck")
             main.DECK_PANEL = ""
+            main.internal_hdr.cache_clear()
             self.assertEqual(main.hdr_mode(), "plain")
             with open(os.path.join(temp.name, "card0-DP-1", "enabled"), "w") as file:
                 file.write("enabled\n")
             self.assertEqual(main.hdr_mode(), "external")
         finally:
             main.DRM_CLASS_DIR, main.DECK_PANEL = original
+            main.internal_hdr.cache_clear()
             temp.cleanup()
+
+    def test_internal_panel_eotf(self):
+        """Other handhelds: gamescope's profile for the built-in panel says PQ or gamma 2.2
+        (with its peak); without one, HDR in the EDID means PQ."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        scripts = os.path.join(temp.name, "scripts", "displays")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "pq.lua"), "w") as file:
+            file.write('''gamescope.config.known_displays.pq_panel = {
+    hdr = { supported = true, eotf = gamescope.eotf.pq },
+    matches = function(display)
+        if display.vendor == "SDC" and display.product == 0x4301 then return 5000 end
+        return -1
+    end,
+}''')
+        with open(os.path.join(scripts, "g22.lua"), "w") as file:
+            file.write('''local types = { { vendor = "DXQ", model = "DXQ7D0023" } }
+gamescope.config.known_displays.g22_panel = {
+    hdr = { supported = true, force_enabled = true, eotf = gamescope.eotf.gamma22,
+            max_content_light_level = 687.448 },
+}''')
+        with open(os.path.join(scripts, "lcd.lua"), "w") as file:
+            # HDR off: the gamma 2.2 there is only a fallback for docking.
+            file.write('''gamescope.config.known_displays.lcd = {
+    hdr = { supported = false, eotf = gamescope.eotf.gamma22 },
+    matches = function(display) if display.vendor == "AAA" then return 5000 end end,
+}''')
+        drm = os.path.join(temp.name, "drm")
+        os.makedirs(os.path.join(drm, "card0-eDP-1"))
+        originals = main.DRM_CLASS_DIR, main.DECK_PANEL, main.GAMESCOPE_SCRIPT_DIRS, main.external_display
+
+        def restore():
+            main.DRM_CLASS_DIR, main.DECK_PANEL, main.GAMESCOPE_SCRIPT_DIRS, main.external_display = originals
+            main.internal_hdr.cache_clear()
+
+        self.addCleanup(restore)
+        main.DRM_CLASS_DIR, main.DECK_PANEL = drm, ""
+        main.GAMESCOPE_SCRIPT_DIRS = (os.path.join(temp.name, "scripts"),)
+        main.external_display = lambda: False
+
+        def panel(edid, deck=""):
+            with open(os.path.join(drm, "card0-eDP-1", "edid"), "wb") as file:
+                file.write(edid)
+            main.DECK_PANEL = deck
+            main.internal_hdr.cache_clear()
+            return main.internal_pq(), main.hdr_mode(), main.pq_output()
+
+        self.assertEqual(main.edid_identity(panel_edid("SDC", 0x4301, "ATNA")), ("SDC", 0x4301, "ATNA"))
+        self.assertEqual(panel(panel_edid("SDC", 0x4301)), (True, "external", True))
+        # Gamma 2.2: Deck OLED's tone mapping with this panel's peak.
+        self.assertEqual(panel(panel_edid("DXQ", 0x1234, "DXQ7D0023")), (False, "deck", False))
+        self.assertEqual(main.g22_panel_nits(), 687.448)
+        self.assertEqual(main.hdr_peak_range(), (400, 680))
+        # No profile: the EDID decides.
+        self.assertEqual(panel(panel_edid("AAA", 1)), (True, "external", True))
+        self.assertEqual(panel(panel_edid("BBB", 1)), (True, "external", True))
+        self.assertEqual(panel(panel_edid("BBB", 1, hdr=False)), (False, "plain", False))
+        # A Deck never: its panel is known.
+        self.assertEqual(panel(panel_edid("SDC", 0x4301), deck="oled"), (False, "deck", False))
+        self.assertEqual(main.g22_panel_nits(), 1000)
+        self.assertEqual(panel(panel_edid("SDC", 0x4301), deck="lcd"), (False, "plain", False))
+        # The brightness settings come with the PQ path.
+        panel(panel_edid("SDC", 0x4301))
+        self.assertTrue(main.hdr_settings_apply())
+        panel(panel_edid("DXQ", 0x1234, "DXQ7D0023"))
+        self.assertTrue(main.hdr_settings_apply())
+        panel(panel_edid("BBB", 1, hdr=False))
+        self.assertFalse(main.hdr_settings_apply())
+
+    def test_shipped_gamescope_profiles(self):
+        """The profiles on this system read as expected, where they exist."""
+        profiles = main.hdr_profiles()
+        if not profiles:
+            self.skipTest("no gamescope display profiles here")
+        known = {("VLV", 0x3003, ""): ("gamma22", 1000), ("SDC", 0x4301, ""): ("pq", None),
+                 ("DXQ", 0, "DXQ7D0023"): ("gamma22", 993), ("YHB", 0, "YHB02P25"): ("gamma22", 687.448)}
+        for identity, expected in known.items():
+            found = main.profile_hdr(identity, profiles)
+            if found is not None:
+                self.assertEqual(found, expected, identity)
 
     def test_hdr_tonemap_and_vulkan_encode(self):
         """Same filters and encoder as kms_hdr_cmd, fed by software frames instead of kmsgrab."""
         temp = tempfile.TemporaryDirectory()
         try:
             modes = dict(main.HDR_FILTERS)
+            modes["deck"] = (main.HDR_INPUT_FILTER, main.deck_tonemap_filter(main.DECK_SHADER))
             modes["external"] = (main.HDR_PQ_INPUT_FILTER, main.pq_tonemap_filter(main.PQ_SHADER))
+            modes["deck-deband"] = (main.HDR_INPUT_FILTER, main.deck_tonemap_filter(main.DECK_SHADER, True))
+            modes["external-deband"] = (main.HDR_PQ_INPUT_FILTER, main.pq_tonemap_filter(main.PQ_SHADER, True))
+            modes["deck-rgb10"] = (main.rgb_input(main.HDR_INPUT_FILTER), main.deck_tonemap_filter(main.DECK_SHADER))
+            modes["external-rgb10"] = (main.rgb_input(main.HDR_PQ_INPUT_FILTER), main.pq_tonemap_filter(main.PQ_SHADER))
             for mode, (input_filter, tonemap_filter) in modes.items():
                 out = os.path.join(temp.name, f"{mode}.mkv")
-                source = "testsrc2=s=1280x800:r=60:d=1,format=nv12"
+                pixels = "x2rgb10le" if mode.endswith("rgb10") else "nv12"
+                source = f"testsrc2=s=1280x800:r=60:d=1,format={pixels}"
                 command = main.ffmpeg_base() + [
                     "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk", "-f", "lavfi", "-i", source,
                     "-vf", f"hwupload,{input_filter},{tonemap_filter}",
@@ -415,6 +773,7 @@ class Lifecycle(unittest.TestCase):
         main.OUTPUT_DIR, main.kms_cmd, main.audio_cmd, main.set_composite_force = self.originals
         main.read_root_prop, main.write_root_prop = self.root_prop_originals
         main.RESTORE_FILE = self.restore_file
+        main._rgb10_order = None
         self.temp.cleanup()
 
     def test_record_and_mux(self):
@@ -712,14 +1071,17 @@ class Lifecycle(unittest.TestCase):
         async def record_write(name, value):
             writes.append((name, value))
 
-        def fake_hdr(output, kbps, fps=60, mode="deck"):
+        def fake_hdr(output, kbps, fps=60, mode="deck", rgb10=False):
             with open(os.path.join(main.SETTINGS_DIR, main.SHADER_NAME)) as file:
-                calls.append((mode, "white_nits = 202.6;" in file.read()))
+                text = file.read()
+                # SDR content: its own white, and nothing above it to roll off.
+                calls.append((mode, "white_nits = 202.6;" in text and "peak_nits = 202.6;" in text))
             return synthetic_video(output, kbps, fps)
 
         async def scenario():
             main.state = main.State()
             main.state.prefs["kms_original_color"] = True
+            main._rgb10_order = "ok"
             await main.start_recording()
             self.assertEqual(main.state.status, "recording", main.state.error_detail)
             self.assertEqual(main.snapshot()["hdr"], "external_sdr")
@@ -740,6 +1102,194 @@ class Lifecycle(unittest.TestCase):
         wideness = main.GAMUT_WIDENESS_PROP
         self.assertEqual(writes, [(wideness, "0"), (wideness, "0")])
 
+    def test_deck_hdr_uses_brightness_settings(self):
+        """An HDR game on Deck OLED's panel: the shader gets the peak and 1.5 x the paper white."""
+        calls = []
+        originals = main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, main.DECK_PANEL
+
+        async def props(name):
+            return "1" if name == main.HDR_APP_PROP else "0"
+
+        async def no_write(name, value):
+            pass
+
+        def fake_hdr(output, kbps, fps=60, mode="deck", rgb10=False):
+            with open(os.path.join(main.SETTINGS_DIR, main.DECK_SHADER_NAME)) as file:
+                text = file.read()
+            calls.append((mode, "peak_nits = 800.0;" in text, "white_nits = 450.0;" in text, rgb10,
+                          "//!HOOK RGB" in text))
+            return synthetic_video(output, kbps, fps)
+
+        async def scenario():
+            main.state = main.State()
+            main.state.prefs["kms_original_color"] = False
+            main.state.prefs["method"] = "kms"
+            main.state.prefs["hdr_peak"], main.state.prefs["hdr_peak_top"] = 800, 1000
+            main.state.prefs["hdr_paper_white"] = 300
+            main._rgb10_order = "swapped"
+            await main.start_recording()
+            self.assertEqual(main.state.status, "recording", main.state.error_detail)
+            await asyncio.sleep(1)
+            await main.finish_recording()
+            return main.state.error
+
+        main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop = fake_hdr, props, no_write
+        main.external_display = lambda: False
+        main.DECK_PANEL = "oled"
+        settings, edid = main.SETTINGS_DIR, main.GAMESCOPE_EDID
+        main.SETTINGS_DIR = self.temp.name
+        # No gamescope EDID: the panel's 1000 nits.
+        main.GAMESCOPE_EDID = os.path.join(self.temp.name, "missing.bin")
+        try:
+            self.assertEqual(asyncio.run(scenario()), "")
+        finally:
+            main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, main.DECK_PANEL = originals
+            main.SETTINGS_DIR, main.GAMESCOPE_EDID = settings, edid
+        self.assertEqual(calls, [("deck", True, True, True, True)])
+
+    def test_external_hdr_game_uses_brightness_settings(self):
+        """An HDR game on an external HDR monitor: the PQ shader gets the monitor's peak and 1.5 x paper white."""
+        calls = []
+        originals = main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display
+
+        async def props(name):
+            return {main.HDR_OUTPUT_PROP: "1", main.HDR_APP_PROP: "1"}.get(name, "0")
+
+        async def no_write(name, value):
+            pass
+
+        def fake_hdr(output, kbps, fps=60, mode="deck", rgb10=False):
+            with open(os.path.join(main.SETTINGS_DIR, main.SHADER_NAME)) as file:
+                text = file.read()
+            calls.append((mode, "peak_nits = 600.0;" in text, "white_nits = 304.5;" in text, rgb10,
+                          "//!HOOK RGB" in text))
+            return synthetic_video(output, kbps, fps)
+
+        async def scenario():
+            main.state = main.State()
+            main.state.prefs["kms_original_color"] = False
+            main.state.prefs["method"] = "kms"
+            main._rgb10_order = "ok"
+            await main.start_recording()
+            self.assertEqual(main.state.status, "recording", main.state.error_detail)
+            await asyncio.sleep(1)
+            await main.finish_recording()
+            return main.state.error
+
+        edid_path = os.path.join(self.temp.name, "edid.bin")
+        with open(edid_path, "wb") as file:
+            file.write(hdr_edid(115))
+        main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop = fake_hdr, props, no_write
+        main.external_display = lambda: True
+        settings, edid = main.SETTINGS_DIR, main.GAMESCOPE_EDID
+        main.SETTINGS_DIR, main.GAMESCOPE_EDID = self.temp.name, edid_path
+        try:
+            self.assertEqual(asyncio.run(scenario()), "")
+        finally:
+            main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display = originals
+            main.SETTINGS_DIR, main.GAMESCOPE_EDID = settings, edid
+        self.assertEqual(calls, [("external", True, True, True, False)])
+
+    def test_rgb10_falls_back_to_nv12(self):
+        """10-bit RGB that does not start on the real screen: HDR again on NV12, shader without the swap."""
+        calls = []
+        originals = main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, \
+            main.DECK_PANEL, main.KMS_START_ATTEMPTS
+
+        async def props(name):
+            return "1" if name == main.HDR_APP_PROP else "0"
+
+        async def no_write(name, value):
+            pass
+
+        def fake_hdr(output, kbps, fps=60, mode="deck", rgb10=False):
+            with open(os.path.join(main.SETTINGS_DIR, main.DECK_SHADER_NAME)) as file:
+                calls.append((rgb10, "//!HOOK RGB" in file.read()))
+            if rgb10:
+                return main.ffmpeg_base() + ["-f", "nonexistent", "-i", "x", output]
+            return synthetic_video(output, kbps, fps)
+
+        async def scenario():
+            main.state = main.State()
+            main.state.prefs["kms_original_color"] = False
+            main.state.prefs["method"] = "kms"
+            main._rgb10_order = "swapped"
+            await main.start_recording()
+            self.assertEqual(main.state.status, "recording", main.state.error_detail)
+            self.assertEqual(main.state.hdr, "deck")
+            self.assertFalse(main.state.hdr_rgb10)
+            await asyncio.sleep(1)
+            await main.finish_recording()
+            return main.state.error
+
+        main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop = fake_hdr, props, no_write
+        main.external_display = lambda: False
+        main.DECK_PANEL = "oled"
+        main.KMS_START_ATTEMPTS = 1
+        settings = main.SETTINGS_DIR
+        main.SETTINGS_DIR = self.temp.name
+        try:
+            self.assertEqual(asyncio.run(scenario()), "")
+        finally:
+            main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, \
+                main.DECK_PANEL, main.KMS_START_ATTEMPTS = originals
+            main.SETTINGS_DIR = settings
+        self.assertEqual(calls, [(True, True), (False, False)])
+        # Not tried again until the panel's retry button, which shows meanwhile.
+        self.assertEqual(main._rgb10_order, "")
+        self.assertTrue(main.snapshot()["hdr_rgb10_failed"])
+        asyncio.run(main.Plugin().retry_rgb10())
+        self.assertIsNone(main._rgb10_order)
+        self.assertFalse(main.snapshot()["hdr_rgb10_failed"])
+
+    def test_internal_pq_panel_sdr_stays_sdr(self):
+        """A built-in PQ panel reporting HDR output: SDR content records on the SDR path,
+        only an HDR game takes the PQ path (the panel may report HDR while it shows SDR)."""
+        calls = []
+        originals = main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, \
+            main.internal_pq, main.DECK_PANEL
+        app_hdr = {"value": "0"}
+
+        async def props(name):
+            if name == main.HDR_APP_PROP:
+                return app_hdr["value"]
+            return "1" if name == main.HDR_OUTPUT_PROP else "0"
+
+        async def no_write(name, value):
+            pass
+
+        def fake_hdr(output, kbps, fps=60, mode="deck", rgb10=False):
+            calls.append(mode)
+            return synthetic_video(output, kbps, fps)
+
+        async def scenario():
+            main.state = main.State()
+            main.state.prefs["kms_original_color"] = False
+            main.state.prefs["method"] = "kms"
+            main._rgb10_order = "ok"
+            await main.start_recording()
+            self.assertEqual(main.state.status, "recording", main.state.error_detail)
+            hdr = main.state.hdr
+            await asyncio.sleep(1)
+            await main.finish_recording()
+            return hdr, main.state.error
+
+        main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop = fake_hdr, props, no_write
+        main.external_display = lambda: False
+        main.internal_pq = lambda: True
+        main.DECK_PANEL = ""
+        settings = main.SETTINGS_DIR
+        main.SETTINGS_DIR = self.temp.name
+        try:
+            self.assertEqual(asyncio.run(scenario()), ("", ""))
+            app_hdr["value"] = "1"
+            self.assertEqual(asyncio.run(scenario()), ("external", ""))
+        finally:
+            main.kms_hdr_cmd, main.read_root_prop, main.write_root_prop, main.external_display, \
+                main.internal_pq, main.DECK_PANEL = originals
+            main.SETTINGS_DIR = settings
+        self.assertEqual(calls, ["external"])
+
     def test_hdr_falls_back_to_sdr(self):
         originals = main.kms_hdr_cmd, main.read_root_prop, main.KMS_START_ATTEMPTS
 
@@ -755,7 +1305,7 @@ class Lifecycle(unittest.TestCase):
             await main.finish_recording()
             return main.state.error, main.state.last_file
 
-        main.kms_hdr_cmd = lambda output, kbps, fps=60, mode="deck": \
+        main.kms_hdr_cmd = lambda output, kbps, fps=60, mode="deck", rgb10=False: \
             main.ffmpeg_base() + ["-f", "nonexistent", "-i", "x", output]
         main.read_root_prop = hdr_on
         main.KMS_START_ATTEMPTS = 1

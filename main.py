@@ -9,6 +9,7 @@ sharing one ffmpeg between kmsgrab and PulseAudio dropped capture to ~17 fps.
 """
 
 import asyncio
+import functools
 import hmac
 import json
 import logging
@@ -80,50 +81,197 @@ FULL_RANGE_RETAG = ["-bsf:v", "h264_metadata=video_full_range_flag=1", "-color_r
 FULL_RANGE_MARK = "full-range"
 # Deck OLED's internal panel runs HDR as "HDR G22": while gamescope outputs HDR,
 # the KMS buffer holds gamma 2.2 values in the panel's own gamut (EDID primaries)
-# up to the panel peak (~950 nits), not PQ. Measured 2026-11-18 with an HDR10 test
-# pattern of known nits. gamescope's own HDR->SDR (the PipeWire capture) is gamma
-# 2.2 with SDR white at ~480 nits, clipping above. To match it: gamma 2.2 in and
-# out (bt470m), contrast 1.37 (about (950/480)^(1/2.2)), and BT.2020 as the input
-# gamut, which beat P3 and the EDID gamut once libplacebo's gamut mapping is
-# included (mean error vs PipeWire ~4 vs ~11 for the earlier sRGB/P3/1.3 values).
-# saturation 1.1 offsets the brightness libplacebo's perceptual gamut mapping takes
-# from saturated reds (gamescope clips instead): red 163 -> ~170, PipeWire 171.
+# up to the panel peak, not PQ. Measured 2026-11-18 with an HDR10 test pattern of
+# known nits (~950); gamescope's display profile (valve.steamdeck.oled.lua) says
+# 1000. gamescope's own HDR->SDR (the PipeWire capture) is gamma 2.2 with SDR white
+# at ~480 nits, clipping above. BT.2020 as the input gamut beat P3 and the EDID
+# gamut against PipeWire once libplacebo's gamut mapping is included (mean error
+# ~4 vs ~11). A saturation 1.1 that made up for what libplacebo's perceptual gamut
+# mapping takes from saturated reds was dropped (user, 2026-11-20): matching
+# PipeWire is not the goal. The brightness comes from a user shader (DECK_SHADER), set
+# from the game's own HDR settings (hdr_peak, hdr_paper_white): white at 1.5 x the
+# paper white (gamescope's PipeWire uses 480; with a 203-nit paper white that white
+# records at ~84%), unchanged up to about half of it, then the highlights up to the
+# peak roll off (BT.2390) on the brightest channel instead of clipping per channel, so
+# bright colors keep their hue (orange at 900 nits stayed orange where clipping
+# made it yellow; 2026-11-20). The earlier contrast=1.37 filter clipped.
 # kmsgrab frames cannot be mapped to Vulkan directly (DRM->Vulkan derive is not
 # implemented, and libplacebo fails to map VAAPI frames), so they go through VAAPI
-# to full-range NV12 in system memory and are uploaded to Vulkan from there. P010
-# came back with wrong colors here; NV12 matched the calibrated RGB path.
+# to system memory and are uploaded to Vulkan from there.
+# The HDR modes with a shader ("deck", "external", "external_sdr") download 10-bit
+# RGB (x2rgb10): NV12 cut the HDR signal to 8 bits before the shader stretched
+# the range below white over the whole recording, and that showed as banding
+# (on a 10-bit ramp the steps halved, 2026-11-21). VAAPI copies RGB to RGB
+# exactly, with no matrix or range to go wrong; its P010 put neutral chroma at
+# 514 instead of 512, which tinted PQ highlights green. Uploaded x2rgb10 reaches
+# libplacebo with red and blue swapped (FFmpeg n8.1.2), and VAAPI cannot write
+# x2bgr10, so the shader swaps them back before any color conversion when
+# rgb10_order() finds them swapped. Anything failing there falls back to NV12.
 HDR_DOWNLOAD_FILTER = (
     "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=pc,setparams=range=tv,"
     "hwdownload,format=nv12"
 )
+HDR_RGB10_DOWNLOAD_FILTER = "scale_vaapi=format=x2rgb10le,hwdownload,format=x2rgb10le"
+# libplacebo's debanding for HDR that arrives as 8-bit NV12 (the 10-bit fallback and
+# the "plain" mode), with its defaults: on a ramp stretched like the recording's the
+# steps came out as smooth as from 10-bit (mean error 0.44 -> 0.18, 10-bit 0.21),
+# at no measurable cost (2026-11-21). 10-bit input needs none.
+DEBAND = "deband=true:"
+# Added to the recording's shader when uploaded x2rgb10 has red and blue swapped.
+# RGB is the first stage, before linearization and gamut conversion.
+SWAP_RB_HOOK = """
+//!HOOK RGB
+//!BIND HOOKED
+//!DESC Screen Recorder: red and blue of the 10-bit RGB upload back in place
+vec4 hook() {
+    return HOOKED_texOff(0).bgra;
+}
+"""
 HDR_INPUT_FILTER = "setparams=color_trc=bt470m:color_primaries=bt2020:colorspace=bt709:range=pc"
-HDR_TONEMAP_FILTER = (
-    "libplacebo=format=nv12:colorspace=bt709:color_primaries=bt709:"
-    "color_trc=bt470m:range=tv:contrast=1.37:saturation=1.1,setparams=color_trc=bt709"
-)
-# The tuned values above fit only Deck OLED's own panel. Elsewhere the HDR path
-# runs without them:
-# - another built-in HDR panel: the same gamma 2.2 reading with the P3-like gamut
-#   and no contrast or saturation adjustment (its peak and gamut are unmeasured);
-# - an external HDR display: gamescope sends HDR10, so the buffer is
+# The template in the plugin folder; each recording gets a copy in the settings
+# folder with the brightness settings filled in (write_deck_shader).
+DECK_SHADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders", "deck_hdr_to_sdr.glsl")
+DECK_SHADER_NAME = "deck_hdr_to_sdr.glsl"
+# The game's HDR peak brightness, in nits, chosen in the panel in 10-nit steps up
+# to the display's own peak (display_hdr_peak); None follows it. The paper white is
+# one of two choices (user, 2026-11-21): 203, the BT.2408 reference white and close
+# to most games' default, or 300 with "Keep HDR Highlights" on, which records a little
+# darker and keeps more of the highlights (white at 450, near gamescope's 480).
+# Both apply to HDR games on an external HDR display and on a built-in HDR panel
+# whose signal is known (hdr_settings_apply): Deck OLED's, or another handheld's.
+HDR_PEAK_MIN = 400
+HDR_PEAK_LIMITS = (100, 10000)
+DISPLAY_PEAK_FALLBACK = 1000
+PAPER_WHITES = [203, 300]
+DEFAULT_PAPER_WHITE = 203
+# The recording's white sits above the paper white, so the game's white is not
+# already the brightest value and its highlights keep some room.
+PAPER_WHITE_HEADROOM = 1.5
+# The EDID gamescope gives games (GAMESCOPE_DISPLAY_EDID_PATH), with its own display
+# profile applied: Deck OLED's panel EDID says 604 nits, this one 1000 like the
+# profile (valve.steamdeck.oled.lua). It follows the display in use.
+GAMESCOPE_EDID = os.path.join(USER_HOME, ".config", "gamescope", "edid.bin")
+
+
+def hdr_white_nits(peak, paper_white):
+    return min(paper_white * PAPER_WHITE_HEADROOM, peak)
+
+
+def edid_hdr_peak(data):
+    """Max luminance in nits from an EDID's HDR static metadata block, if it has PQ."""
+    for start in range(128, len(data) - 127, 128):
+        block = data[start:start + 128]
+        if block[0] != 0x02:
+            continue
+        end, at = min(block[2], 127), 4
+        while 4 <= at < end:
+            tag, length = block[at] >> 5, block[at] & 31
+            if tag == 7 and length >= 4 and block[at + 1] == 6:
+                eotfs, max_code = block[at + 2], block[at + 4]
+                if eotfs & 4 and max_code:
+                    return 50 * 2 ** (max_code / 32)
+            at += length + 1
+    return None
+
+
+def round_peak(nits):
+    """10-nit steps; a value within 2 % of a hundred is that hundred (1015.2 -> 1000)."""
+    hundred = round(nits / 100) * 100
+    if hundred and abs(nits - hundred) <= hundred * 0.02:
+        return int(hundred)
+    return int(round(nits / 10) * 10)
+
+
+_display_peak = {"key": None, "peak": None}
+
+
+def display_hdr_peak():
+    """The HDR peak of the display gamescope drives, in nits, or None without HDR."""
+    try:
+        info = os.stat(GAMESCOPE_EDID)
+    except OSError:
+        return None
+    key = (info.st_mtime_ns, info.st_size)
+    if _display_peak["key"] != key:
+        try:
+            with open(GAMESCOPE_EDID, "rb") as handle:
+                nits = edid_hdr_peak(handle.read())
+        except OSError:
+            nits = None
+        peak = round_peak(nits) if nits else None
+        if peak is not None:
+            peak = min(max(peak, HDR_PEAK_LIMITS[0]), HDR_PEAK_LIMITS[1])
+        _display_peak.update(key=key, peak=peak)
+    return _display_peak["peak"]
+
+
+def hdr_settings_apply():
+    """Whether the brightness settings are used: an external HDR display, or a built-in
+    HDR panel whose signal is known (PQ, or gamma 2.2 with a known peak)."""
+    if external_display():
+        return display_hdr_peak() is not None
+    return internal_pq() or g22_panel_nits() is not None
+
+
+def hdr_peak_range():
+    top = display_hdr_peak() or DISPLAY_PEAK_FALLBACK
+    panel = g22_panel_nits()
+    if not external_display() and panel:
+        # A gamma 2.2 panel's buffer holds its own peak at most (deck_hdr_to_sdr.glsl);
+        # rounded down, so the top is never above it (687.4 -> 680).
+        top = min(top, int(panel // 10 * 10))
+    return min(HDR_PEAK_MIN, top), top
+
+
+def hdr_peak():
+    """The peak to roll off from: the setting, within the display's range.
+
+    A setting belongs to the top it was chosen under (hdr_peak_top): once the top
+    changes (another display, a new EDID) it goes back to following the top.
+    """
+    low, high = hdr_peak_range()
+    chosen = state.prefs["hdr_peak"]
+    if chosen is not None and state.prefs["hdr_peak_top"] != high:
+        state.prefs["hdr_peak"] = state.prefs["hdr_peak_top"] = None
+        save_prefs()
+        chosen = None
+    return high if chosen is None else min(max(chosen, low), high)
+
+
+def deck_tonemap_filter(shader, deband=False):
+    """RGB for the shader (on planar output it would also run on the chroma planes),
+    then a second pass to NV12, as in pq_tonemap_filter. deband for 8-bit input."""
+    return (
+        f"libplacebo=format=rgba:{DEBAND if deband else ''}color_primaries=bt709:color_trc=bt470m:range=pc:"
+        f"custom_shader_path={shader},"
+        "setparams=color_trc=bt709:color_primaries=bt709:range=pc,"
+        "libplacebo=format=nv12:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+    )
+# The same shader serves other handhelds whose panels gamescope drives as gamma
+# 2.2, with their own peak (internal_hdr). Elsewhere:
+# - a built-in HDR panel whose peak is unknown ("plain"): the same gamma 2.2
+#   reading with the P3-like gamut, clipped at the panel's peak;
+# - an external HDR display, or a built-in panel that takes PQ (internal_pq):
+#   gamescope sends HDR10, so the buffer is
 #   read as PQ with BT.2020 primaries. libplacebo clips it to BT.709 (still PQ, RGB)
-#   and a user shader turns that into gamma 2.2 with a 480-nit white, clipping
-#   above, which is what gamescope's own PipeWire stream measured on both Deck OLED
-#   and an external monitor (2026-11-18). A second pass makes NV12; the shader
+#   and a user shader turns that into gamma 2.2. gamescope's own PipeWire stream
+#   puts white at 480 nits and clips above (measured on both Deck OLED and an
+#   external monitor, 2026-11-18); for an HDR game the shader instead uses the
+#   brightness settings and rolls the highlights off, as on Deck OLED's panel
+#   (2026-11-21). A second pass makes NV12; the shader
 #   needs RGB, since on planar output it would also run on the chroma planes.
 #   libplacebo's default tone mapping here lifted shadows and washed out colors.
 HDR_PLAIN_INPUT_FILTER = "setparams=color_trc=bt470m:color_primaries=smpte432:colorspace=bt709:range=pc"
 HDR_PLAIN_TONEMAP_FILTER = (
-    "libplacebo=format=nv12:colorspace=bt709:color_primaries=bt709:"
+    f"libplacebo=format=nv12:{DEBAND}colorspace=bt709:color_primaries=bt709:"
     "color_trc=bt470m:range=tv,setparams=color_trc=bt709"
 )
 HDR_PQ_INPUT_FILTER = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt709:range=pc"
 PQ_SHADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders", "pq_to_sdr.glsl")
-# SDR white in nits for the shader: gamescope's PipeWire stream puts an HDR game's
-# white at about 480. SDR content on an HDR output sits at Steam's "SDR content
-# brightness" (SDR_ON_HDR_PROP, a float), gamma 2.2: measured 2026-11-18 on an
-# external monitor, the gray steps matched 203 * (v/255)^2.2 within 2-3%.
-HDR_WHITE_NITS = 480.0
+# SDR content on an HDR output sits at Steam's "SDR content brightness"
+# (SDR_ON_HDR_PROP, a float), gamma 2.2: measured 2026-11-18 on an external
+# monitor, the gray steps matched 203 * (v/255)^2.2 within 2-3%. The shader uses it
+# as white and peak, so SDR content keeps its own levels.
 SDR_ON_HDR_PROP = "GAMESCOPE_SDR_ON_HDR_CONTENT_BRIGHTNESS"
 SDR_ON_HDR_DEFAULT_NITS = 203.0
 # Written with the white level of each recording into the settings folder, whose
@@ -132,27 +280,31 @@ SDR_ON_HDR_DEFAULT_NITS = 203.0
 SHADER_NAME = "pq_to_sdr.glsl"
 
 
-def pq_tonemap_filter(shader):
+def pq_tonemap_filter(shader, deband=False):
     return (
-        "libplacebo=format=rgba:color_primaries=bt709:color_trc=smpte2084:range=pc:"
+        f"libplacebo=format=rgba:{DEBAND if deband else ''}color_primaries=bt709:color_trc=smpte2084:range=pc:"
         f"tonemapping=clip:gamut_mode=clip:peak_detect=false:custom_shader_path={shader},"
         "setparams=color_trc=bt709:color_primaries=bt709:range=pc,"
         "libplacebo=format=nv12:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
     )
 
 
-# HDR conversion per mode: "deck" (tuned, Deck OLED panel), "plain", "external"
-# (an HDR game on an external HDR output) and "external_sdr" (SDR content there:
-# an external display in HDR mode carries everything as PQ, so the plain SDR path
+# HDR conversion per mode: "deck" (a gamma 2.2 panel: Deck OLED or another
+# handheld's), "plain", "external" (an HDR game on PQ: an external HDR output or a
+# built-in panel that takes PQ) and "external_sdr" (SDR content on an external
+# display in HDR mode, which carries everything as PQ, so the plain SDR path
 # recorded it gray and flat). Both external modes use the PQ filters with the
 # shader written for the recording (pq_tonemap_filter).
 PQ_MODES = ("external", "external_sdr")
+HDR_SHADER_MODES = ("deck",) + PQ_MODES
+# "deck" uses the shader written for the recording (deck_tonemap_filter).
 HDR_FILTERS = {
-    "deck": (HDR_INPUT_FILTER, HDR_TONEMAP_FILTER),
     "plain": (HDR_PLAIN_INPUT_FILTER, HDR_PLAIN_TONEMAP_FILTER),
 }
 # 1 while gamescope sends HDR to the display. Only used for external displays:
-# Deck OLED's own panel reports 1 even while its buffer holds plain SDR.
+# Deck OLED's own panel reports 1 even while its buffer holds plain SDR, and other
+# built-in panels may too (Legion Go 2 OLED's profile switches to PQ only for HDR
+# content), so on a built-in panel only an HDR game takes the PQ path (hdr_mode).
 HDR_OUTPUT_PROP = "GAMESCOPE_HDR_OUTPUT_FEEDBACK"
 DRM_CLASS_DIR = "/sys/class/drm"
 # Set by gamescope when the focused game renders in an HDR colorspace. Not
@@ -285,21 +437,34 @@ def vulkan_encode_args(kbps, fps=FRAMERATE):
     ]
 
 
-def kms_hdr_cmd(output, kbps, fps=FRAMERATE, mode="deck"):
+def rgb_input(input_filter):
+    """An input filter for 10-bit RGB frames instead of NV12."""
+    return input_filter.replace("colorspace=bt709", "colorspace=gbr")
+
+
+def kms_hdr_cmd(output, kbps, fps=FRAMERATE, mode="deck", rgb10=False):
     """KMS capture of an HDR screen, converted to SDR on the GPU with libplacebo.
 
     Deck's VAAPI driver has no HDR tone mapping, and libplacebo's Vulkan frames
     cannot be handed to the VAAPI encoder, so this path encodes with Vulkan.
+    With rgb10 the shader modes take 10-bit RGB instead of NV12.
     """
+    download = HDR_DOWNLOAD_FILTER
+    deband = not rgb10
     if mode in PQ_MODES:
         input_filter = HDR_PQ_INPUT_FILTER
-        tonemap_filter = pq_tonemap_filter(os.path.join(SETTINGS_DIR, SHADER_NAME))
+        tonemap_filter = pq_tonemap_filter(os.path.join(SETTINGS_DIR, SHADER_NAME), deband)
+    elif mode == "deck":
+        input_filter = HDR_INPUT_FILTER
+        tonemap_filter = deck_tonemap_filter(os.path.join(SETTINGS_DIR, DECK_SHADER_NAME), deband)
     else:
         input_filter, tonemap_filter = HDR_FILTERS[mode]
+    if rgb10 and mode in HDR_SHADER_MODES:
+        download, input_filter = HDR_RGB10_DOWNLOAD_FILTER, rgb_input(input_filter)
     return ffmpeg_base() + progress_args(output) + [
         "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk",
         "-device", KMS_DEVICE, "-f", "kmsgrab", "-framerate", str(fps), "-i", "-",
-        "-vf", (f"hwmap=derive_device=vaapi,{HDR_DOWNLOAD_FILTER},hwupload,"
+        "-vf", (f"hwmap=derive_device=vaapi,{download},hwupload,"
                 f"{input_filter},{tonemap_filter}"),
     ] + vulkan_encode_args(kbps, fps) + FLUSH_ARGS + [output]
 
@@ -810,6 +975,9 @@ class State:
             # PipeWire by default: it needs no forced composition or display changes.
             "method": "pw", "quality": DEFAULT_PRESET, "custom_mbps": DEFAULT_CUSTOM_MBPS,
             "kms_original_color": True, "fps": FRAMERATE,
+            # None: the display's own peak.
+            # hdr_peak_top: the top of the range hdr_peak was chosen under.
+            "hdr_peak": None, "hdr_peak_top": None, "hdr_paper_white": DEFAULT_PAPER_WHITE,
             # Mono by default: most headset and built-in microphones record one voice
             # into both channels anyway.
             "mic": False, "mic_mode": "mix", "mic_mono": True,
@@ -840,6 +1008,7 @@ class State:
         self.monitor = None
         self.panel_saved = None
         self.hdr = ""
+        self.hdr_rgb10 = False
         self.fps = FRAMERATE
 
 
@@ -863,6 +1032,14 @@ def load_prefs():
     original = saved.get("kms_original_color", saved.get("kms_disable_mura"))
     if isinstance(original, bool):
         state.prefs["kms_original_color"] = original
+    peak = saved.get("hdr_peak")
+    if isinstance(peak, int) and not isinstance(peak, bool) and \
+            HDR_PEAK_LIMITS[0] <= peak <= HDR_PEAK_LIMITS[1] and peak % 10 == 0:
+        top = saved.get("hdr_peak_top")
+        if isinstance(top, int) and not isinstance(top, bool):
+            state.prefs["hdr_peak"], state.prefs["hdr_peak_top"] = peak, top
+    if saved.get("hdr_paper_white") in PAPER_WHITES:
+        state.prefs["hdr_paper_white"] = saved["hdr_paper_white"]
     if isinstance(saved.get("mic"), bool):
         state.prefs["mic"] = saved["mic"]
     if saved.get("mic_mode") in MIC_MODES:
@@ -917,9 +1094,124 @@ def external_display():
 
 def hdr_mode():
     """Which HDR conversion fits the screen being captured."""
-    if external_display():
+    if pq_output():
         return "external"
-    return "deck" if DECK_PANEL == "oled" else "plain"
+    # Gamma 2.2 with a known peak: Deck OLED's tone mapping, with that panel's peak.
+    return "deck" if g22_panel_nits() else "plain"
+
+
+# Where gamescope looks for display profiles (gamescope.config.known_displays). A
+# built-in HDR panel's output EOTF is set there: Deck OLED, Zotac Zone and
+# OneXPlayer F1 OLED use gamma 2.2 up to the profile's max_content_light_level
+# (1000, 993, 687), Legion Go 2 OLED PQ (gamescope 3.16, 2026-11-21). A panel with
+# HDR in its EDID and no profile gets gamescope's default, PQ, like an external
+# display. Gamma 2.2 panels get Deck OLED's tone mapping with their own peak and
+# gamut reading (BT.2020, as measured on Deck OLED). Only Deck OLED was checked.
+GAMESCOPE_SCRIPT_DIRS = ("/usr/share/gamescope/scripts", "/etc/gamescope/scripts",
+                         os.path.join(USER_HOME, ".config", "gamescope", "scripts"))
+
+
+def edid_identity(edid):
+    """(vendor, product code, model name) from an EDID base block, or None."""
+    if len(edid) < 128 or edid[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None
+    code = (edid[8] << 8) | edid[9]
+    vendor = "".join(chr(((code >> shift) & 31) + 64) for shift in (10, 5, 0))
+    product = edid[10] | (edid[11] << 8)
+    model = ""
+    for at in range(54, 126, 18):
+        if edid[at:at + 3] == b"\x00\x00\x00" and edid[at + 3] == 0xFC:
+            model = edid[at + 5:at + 18].split(b"\n")[0].decode("ascii", "replace").strip()
+    return vendor, product, model
+
+
+def hdr_profiles(dirs=None):
+    """The HDR display profiles gamescope has: (vendors, products, models, eotf, peak
+    nits or None) per file. Read from the Lua text, so only the plain forms the shipped profiles use;
+    a file with HDR off (fallbacks for docking) or mixed EOTFs is left out."""
+    profiles = []
+    for top in dirs or GAMESCOPE_SCRIPT_DIRS:
+        for folder, _, files in os.walk(top):
+            for name in sorted(files):
+                if not name.endswith(".lua"):
+                    continue
+                try:
+                    with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as handle:
+                        text = handle.read()
+                except OSError:
+                    continue
+                eotfs = set(re.findall(r"eotf\s*=\s*gamescope\.eotf\.(\w+)", text))
+                if not re.search(r"supported\s*=\s*true", text) or len(eotfs) != 1:
+                    continue
+                products = {int(value, 0) for value in
+                            re.findall(r"product\s*==\s*(0x[0-9a-fA-F]+|\d+)", text)}
+                peaks = {float(value) for value in
+                         re.findall(r"max_content_light_level\s*=\s*([0-9.]+)", text)}
+                profiles.append((set(re.findall(r'vendor\s*==?\s*"([^"]+)"', text)), products,
+                                 set(re.findall(r'model\s*==?\s*"([^"]+)"', text)), eotfs.pop(),
+                                 peaks.pop() if len(peaks) == 1 else None))
+    return profiles
+
+
+def profile_hdr(identity, profiles):
+    """(eotf, peak nits) of the profile matching a panel (vendor and product or
+    model), or None."""
+    if not identity:
+        return None
+    vendor, product, model = identity
+    for vendors, products, models, eotf, peak in profiles:
+        if vendor in vendors and (product in products or model in models):
+            return eotf, peak
+    return None
+
+
+def internal_panel_edid():
+    try:
+        names = sorted(os.listdir(DRM_CLASS_DIR))
+    except OSError:
+        return b""
+    for name in names:
+        if name.startswith("card") and "-eDP-" in name:
+            try:
+                with open(os.path.join(DRM_CLASS_DIR, name, "edid"), "rb") as handle:
+                    edid = handle.read()
+            except OSError:
+                continue
+            if edid:
+                return edid
+    return b""
+
+
+@functools.lru_cache(maxsize=1)
+def internal_hdr():
+    """(eotf, peak nits) of the built-in panel in HDR: "gamma22" or "pq", or None
+    without HDR. Deck OLED is known; elsewhere gamescope's profile for the panel
+    decides, else PQ if its EDID offers it."""
+    if DECK_PANEL == "oled":
+        return "gamma22", float(DISPLAY_PEAK_FALLBACK)
+    if DECK_PANEL:
+        return None, None
+    edid = internal_panel_edid()
+    found = profile_hdr(edid_identity(edid), hdr_profiles())
+    if found is not None:
+        return found
+    return ("pq", None) if edid_hdr_peak(edid) is not None else (None, None)
+
+
+def internal_pq():
+    """Whether the built-in panel takes PQ in HDR, as an external HDR display does."""
+    return internal_hdr()[0] == "pq"
+
+
+def g22_panel_nits():
+    """The peak of a built-in gamma 2.2 HDR panel (1.0 in its buffer), or None."""
+    eotf, peak = internal_hdr()
+    return peak if eotf == "gamma22" and peak else None
+
+
+def pq_output():
+    """Whether the lit screen gets PQ while an HDR game runs."""
+    return external_display() or internal_pq()
 
 
 # sRGB/BT.709 primaries (x, y) and the triangle area they span on the xy chart.
@@ -1057,6 +1349,12 @@ def snapshot():
         "elapsed": round(time.monotonic() - state.started_at, 2) if capturing else 0,
         "free_gb": free_gb(),
         "original_color": original_color_note(),
+        "hdr_settings": hdr_settings_apply(),
+        "hdr_peak_range": list(hdr_peak_range()),
+        "hdr_peak": hdr_peak(),
+        "paper_whites": PAPER_WHITES,
+        # 10-bit HDR input failed (the check or a capture): NV12 until retried.
+        "hdr_rgb10_failed": _rgb10_order == "",
         "output_dir": output_dir(),
         "output_dir_custom": bool(state.prefs.get("output_dir")),
     }
@@ -1111,15 +1409,94 @@ async def write_root_prop(name, value):
         log.warning("could not update %s: %s", name, output.strip())
 
 
-def write_pq_shader(white_nits, folder=None):
-    """Copy the PQ shader into the settings folder with this recording's white level."""
+def write_shader(template, name, peak_nits, white_nits, folder=None, swap_rb=False, panel_nits=None):
     folder = folder or SETTINGS_DIR
-    with open(PQ_SHADER, encoding="utf-8") as handle:
+    with open(template, encoding="utf-8") as handle:
         text = handle.read()
+    if panel_nits:
+        text = re.sub(r"const float panel_nits = [0-9.]+;", f"const float panel_nits = {panel_nits:.1f};", text)
+    text = re.sub(r"const float peak_nits = [0-9.]+;", f"const float peak_nits = {peak_nits:.1f};", text)
     text = re.sub(r"const float white_nits = [0-9.]+;", f"const float white_nits = {white_nits:.1f};", text)
+    if swap_rb:
+        text += SWAP_RB_HOOK
     os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, SHADER_NAME), "w", encoding="utf-8") as handle:
+    with open(os.path.join(folder, name), "w", encoding="utf-8") as handle:
         handle.write(text)
+
+
+def write_deck_shader(peak_nits, white_nits, folder=None, swap_rb=False, panel_nits=None):
+    """Copy the gamma 2.2 panel shader into the settings folder with this recording's
+    levels; panel_nits is the panel's peak (Deck OLED's 1000 in the template)."""
+    write_shader(DECK_SHADER, DECK_SHADER_NAME, peak_nits, white_nits, folder, swap_rb, panel_nits)
+
+
+def write_pq_shader(white_nits, folder=None, peak_nits=None, swap_rb=False):
+    """Copy the PQ shader into the settings folder with this recording's levels.
+
+    Without peak_nits the peak is the white, which clips there (SDR content).
+    """
+    peak_nits = white_nits if peak_nits is None else peak_nits
+    write_shader(PQ_SHADER, SHADER_NAME, peak_nits, white_nits, folder, swap_rb)
+
+
+async def write_hdr_shader(hdr, swap_rb=False):
+    """Write the shader an HDR mode reads, with this recording's levels."""
+    if hdr in ("external", "deck"):
+        # An HDR game: from the game's peak down to 1.5 x its paper white.
+        peak = hdr_peak()
+        white = hdr_white_nits(peak, state.prefs["hdr_paper_white"])
+        if hdr == "external":
+            write_pq_shader(white, peak_nits=peak, swap_rb=swap_rb)
+        else:
+            write_deck_shader(peak, white, swap_rb=swap_rb, panel_nits=g22_panel_nits())
+    elif hdr == "external_sdr":
+        write_pq_shader(await read_float_prop(SDR_ON_HDR_PROP, SDR_ON_HDR_DEFAULT_NITS), swap_rb=swap_rb)
+
+
+def rgb10_check_cmd():
+    """A red frame uploaded as x2rgb10 and read back through libplacebo."""
+    return ffmpeg_base() + [
+        "-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk",
+        "-f", "lavfi", "-i", "color=c=red:s=16x16:d=0.04", "-frames:v", "1", "-vf",
+        "format=x2rgb10le,hwupload,setparams=color_primaries=bt709:color_trc=bt709:colorspace=gbr:range=pc,"
+        "libplacebo=format=rgba:color_primaries=bt709:color_trc=bt709:range=pc,hwdownload,format=rgba",
+        "-f", "rawvideo", "-",
+    ]
+
+
+def rgb10_order_from(pixel):
+    """"ok" or "swapped" from the RGBA bytes of the red check frame, "" if neither."""
+    if len(pixel) < 3:
+        return ""
+    red, _, blue = pixel[:3]
+    if red >= 200 and blue <= 55:
+        return "ok"
+    if blue >= 200 and red <= 55:
+        return "swapped"
+    return ""
+
+
+_rgb10_order = None
+
+
+async def rgb10_order():
+    """How 10-bit RGB frames reach libplacebo: "ok", "swapped", or "" when they do
+    not (then the HDR path stays on NV12). Checked once, again after retry_rgb10."""
+    global _rgb10_order
+    if _rgb10_order is None:
+        process = await asyncio.create_subprocess_exec(
+            *rgb10_check_cmd(), env=clean_env(), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            output, _ = await asyncio.wait_for(process.communicate(), 15)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            output = b""
+        _rgb10_order = rgb10_order_from(output[:4]) if process.returncode == 0 else ""
+        log.info("10-bit RGB for HDR: %s", _rgb10_order or "unavailable, using NV12")
+    return _rgb10_order
 
 
 async def read_float_prop(name, default):
@@ -1195,7 +1572,8 @@ async def restore_after_crash():
 async def start_video(method, video_path, log_path, kbps, size, hdr="", fps=FRAMERATE):
     """Start the capture and return (video process, feeder process)."""
     if method == "kms" and hdr:
-        return await spawn(kms_hdr_cmd(video_path, kbps, fps, hdr), log_path, extra_env=VULKAN_ENCODE_ENV), None
+        return await spawn(kms_hdr_cmd(video_path, kbps, fps, hdr, state.hdr_rgb10), log_path,
+                           extra_env=VULKAN_ENCODE_ENV), None
     if method == "kms":
         return await spawn(kms_cmd(video_path, kbps, fps), log_path), None
     read_fd, write_fd = os.pipe()
@@ -1299,6 +1677,8 @@ async def start_recording(method=None):
             work_dir = os.path.join(target, time.strftime(".rec-%Y%m%d-%H%M%S"))
             os.makedirs(work_dir)
             own_path(work_dir)
+            # Only an external display: a built-in panel may report HDR output while
+            # its buffer holds SDR (HDR_OUTPUT_PROP), so there only HDR games go to PQ.
             output_hdr = external_display() and await read_root_prop(HDR_OUTPUT_PROP) == "1"
             if method == "kms":
                 note_display_change(None)
@@ -1321,10 +1701,9 @@ async def start_recording(method=None):
                 hdr = "external" if app_hdr else "external_sdr"
             elif app_hdr:
                 hdr = hdr_mode()
-            if hdr in PQ_MODES:
-                white = HDR_WHITE_NITS if hdr == "external" else \
-                    await read_float_prop(SDR_ON_HDR_PROP, SDR_ON_HDR_DEFAULT_NITS)
-                write_pq_shader(white)
+            order = await rgb10_order() if hdr in HDR_SHADER_MODES else ""
+            state.hdr_rgb10 = bool(order)
+            await write_hdr_shader(hdr, swap_rb=order == "swapped")
             # Shown on the card already while the start check runs.
             state.kbps, state.size, state.fps, state.hdr = kbps, size, fps, hdr
             sink = await default_sink()
@@ -1339,11 +1718,27 @@ async def start_recording(method=None):
             except RuntimeError:
                 if not hdr or method != "kms":
                     raise
-                # Keep recording even if the HDR conversion cannot start on this system.
-                log.warning("HDR capture failed to start, falling back to the SDR path")
-                hdr = state.hdr = ""
-                video, feeder, audio, mic = await start_capture(method, work_dir, sink, source, kbps, size,
-                                                                state.prefs["mic_mono"], hdr, fps)
+                video = None
+                if state.hdr_rgb10:
+                    # Real KMS frames may not take the 10-bit path; NV12 is the tried one.
+                    # Not tried again until the panel's retry button (retry_rgb10) or a
+                    # plugin reload, so later recordings do not wait for the same failure.
+                    global _rgb10_order
+                    log.warning("10-bit HDR capture failed to start, falling back to NV12")
+                    state.hdr_rgb10 = False
+                    _rgb10_order = ""
+                    await write_hdr_shader(hdr)
+                    try:
+                        video, feeder, audio, mic = await start_capture(
+                            method, work_dir, sink, source, kbps, size, state.prefs["mic_mono"], hdr, fps)
+                    except RuntimeError:
+                        pass
+                if video is None:
+                    # Keep recording even if the HDR conversion cannot start on this system.
+                    log.warning("HDR capture failed to start, falling back to the SDR path")
+                    hdr = state.hdr = ""
+                    video, feeder, audio, mic = await start_capture(method, work_dir, sink, source, kbps, size,
+                                                                    state.prefs["mic_mono"], hdr, fps)
         except Exception as error:
             log.exception("start failed")
             if forced_composite:
@@ -1549,6 +1944,13 @@ class Plugin:
         refresh_latest(items)
         return {"deleted": bool(deleted), "items": items}
 
+    async def retry_rgb10(self):
+        """Check 10-bit HDR input again at the next HDR recording."""
+        global _rgb10_order
+        if state.status == "idle":
+            _rgb10_order = None
+        return snapshot()
+
     async def clear_error(self):
         state.error = ""
         state.error_detail = ""
@@ -1615,6 +2017,22 @@ class Plugin:
         state.prefs["output_dir"] = path if path != OUTPUT_DIR else ""
         save_prefs()
         refresh_latest()
+        return snapshot()
+
+    async def set_hdr_peak(self, nits):
+        low, high = hdr_peak_range()
+        if isinstance(nits, (int, float)) and not isinstance(nits, bool) and state.status == "idle":
+            peak = int(min(max(round(nits / 10) * 10, low), high))
+            # The top itself follows the display from then on.
+            state.prefs["hdr_peak"] = None if peak == high else peak
+            state.prefs["hdr_peak_top"] = None if peak == high else high
+            save_prefs()
+        return snapshot()
+
+    async def set_hdr_paper_white(self, nits):
+        if nits in PAPER_WHITES and state.status == "idle":
+            state.prefs["hdr_paper_white"] = nits
+            save_prefs()
         return snapshot()
 
     async def set_kms_original_color(self, enabled):

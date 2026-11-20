@@ -18,6 +18,7 @@ FILES = (
     "README.md",
     "dist/index.js",
     "shaders/pq_to_sdr.glsl",
+    "shaders/deck_hdr_to_sdr.glsl",
 )
 
 version = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]

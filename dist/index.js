@@ -14,25 +14,41 @@ catch {
 const callable = api.callable;
 const getState = callable("get_state");
 const clearError = callable("clear_error");
+const retryRgb10 = callable("retry_rgb10");
 const setMethod = callable("set_method");
 const setQuality = callable("set_quality");
 const setCustomMbps = callable("set_custom_mbps");
-// The slider moves at once; the backend hears the value once it stops moving.
+const setHdrPeak = callable("set_hdr_peak");
+const setHdrPaperWhite = callable("set_hdr_paper_white");
+// A slider moves at once; the backend hears the value once it stops moving.
 // Until the backend has stored it, states from polls (or from saving an earlier
 // value) still carry the old number and would make the slider jump back, so the
-// value being set wins over theirs.
+// value being set wins over theirs. One entry per slider, by pref name.
 const SLIDER_SAVE_MS = 300;
-let sliderTimer = null;
-let pendingMbps = null;
+const sliderTimers = {};
+const pendingPrefs = {};
 
-function withPendingMbps(next) {
-    if (pendingMbps === null || !next?.prefs) return next;
-    const kbps = pendingMbps * 1000;
-    return {
-        ...next,
-        prefs: { ...next.prefs, custom_mbps: pendingMbps },
-        preview_kbps: next.prefs.quality === "custom" ? { 800: kbps, 1080: kbps } : next.preview_kbps,
-    };
+function withPendingPrefs(next) {
+    if (!next?.prefs || !Object.keys(pendingPrefs).length) return next;
+    const result = { ...next, prefs: { ...next.prefs, ...pendingPrefs } };
+    if ("custom_mbps" in pendingPrefs && next.prefs.quality === "custom") {
+        const kbps = pendingPrefs.custom_mbps * 1000;
+        result.preview_kbps = { 800: kbps, 1080: kbps };
+    }
+    return result;
+}
+
+function saveSlider(key, save, value, current, setS) {
+    pendingPrefs[key] = value;
+    setS(current);
+    clearTimeout(sliderTimers[key]);
+    sliderTimers[key] = setTimeout(() => save(value).then((saved) => {
+        // Stored, and no newer value since: the backend's number is right again.
+        if (pendingPrefs[key] === value && saved?.prefs?.[key] === value) delete pendingPrefs[key];
+        setS(saved);
+    }).catch(() => {
+        delete pendingPrefs[key];
+    }), SLIDER_SAVE_MS);
 }
 const setFps = callable("set_fps");
 const setKmsOriginalColor = callable("set_kms_original_color");
@@ -98,8 +114,8 @@ const STRINGS = {
         "original.note.vivid": "While recording, sets color vibrancy to Native, uses the native color temperature and turns off night mode. The screen looks more vivid meanwhile",
         "original.note.plain": "While recording, sets color vibrancy to Native, uses the native color temperature and turns off night mode",
         "hdr.plain": "uncalibrated",
-        "hdr.external": "external display",
-        "hdr.external_sdr": "external HDR display",
+        "hdr.external": "HDR10 display",
+        "hdr.external_sdr": "HDR10 display",
         "quality": "Quality",
         "preset_low": "Low",
         "preset_medium": "Medium",
@@ -118,6 +134,14 @@ const STRINGS = {
         "active": "{width}x{height} · {rate} Mbps",
         "fps": "Frame Rate",
         "fps.note": "30 FPS lowers the load while recording. The bit rate stays the same",
+        "hdr.peak": "HDR Peak Brightness",
+        "hdr.note": "For HDR games recorded with KMS. Set it to the game's own HDR peak brightness. Anything brighter than white is eased off instead of clipped",
+        "hdr.white": "Keep HDR Highlights",
+        "hdr.white.203.note": "Most scenes record about as bright as the game shows them (paper white 203)",
+        "hdr.white.300.note": "Everything records a little darker, and bright parts like sunlight and reflections lose less detail (paper white 300)",
+        "hdr.rgb10.failed": "10-bit HDR capture did not start on this device, so HDR games record in 8-bit. Debanding smooths skies and dark gradients, but some banding may remain",
+        "hdr.rgb10.retry": "Retry 10-bit",
+        "hdr.rgb10.retry.note": "The next HDR recording tries 10-bit again, and falls back to 8-bit if it still fails",
         "free": "{gb} GB free",
         "last": "Last recording",
         "folder.change": "Change Save Folder",
@@ -171,8 +195,8 @@ const STRINGS = {
         "original.note.vivid": "녹화 중에만 채도를 Native로, 색온도를 기본으로 바꾸며 야간 모드를 끕니다. 그동안 화면 색이 진해 보입니다",
         "original.note.plain": "녹화 중에만 채도를 Native로, 색온도를 기본으로 바꾸며 야간 모드를 끕니다",
         "hdr.plain": "보정 없음",
-        "hdr.external": "외부 화면",
-        "hdr.external_sdr": "외부 HDR 화면",
+        "hdr.external": "HDR10 화면",
+        "hdr.external_sdr": "HDR10 화면",
         "quality": "화질",
         "preset_low": "낮음",
         "preset_medium": "중간",
@@ -191,6 +215,14 @@ const STRINGS = {
         "active": "{width}x{height} · {rate} Mbps",
         "fps": "프레임 레이트",
         "fps.note": "30 FPS는 녹화 부담이 줄어듭니다. 비트레이트는 같습니다",
+        "hdr.peak": "HDR 최대 밝기",
+        "hdr.note": "KMS로 HDR 게임을 녹화할 때 쓰입니다. 게임의 HDR 최대 밝기 설정과 같게 맞추세요. 흰색보다 밝은 부분은 잘리지 않고 부드럽게 줄어듭니다",
+        "hdr.white": "HDR 하이라이트 보존",
+        "hdr.white.203.note": "대부분의 장면이 게임 화면과 비슷한 밝기로 녹화됩니다 (페이퍼화이트 203)",
+        "hdr.white.300.note": "전체가 조금 어두워지는 대신 햇빛이나 반사광 같은 밝은 부분이 덜 뭉개집니다 (페이퍼화이트 300)",
+        "hdr.rgb10.failed": "이 기기에서 10비트 HDR 녹화를 시작하지 못해 HDR 게임을 8비트로 녹화합니다. 하늘이나 어두운 그라데이션의 계단 무늬는 디밴딩으로 줄이지만 조금 남을 수 있습니다",
+        "hdr.rgb10.retry": "10비트 다시 시도",
+        "hdr.rgb10.retry.note": "다음 HDR 녹화에서 10비트를 다시 시도하고, 또 실패하면 8비트로 녹화합니다",
         "free": "남은 공간 {gb}GB",
         "last": "최근 녹화",
         "folder.change": "저장 위치 변경",
@@ -564,7 +596,7 @@ function Slot({ id, menu, children }) {
 function App() {
     const [s, setState] = useState(cachedState);
     const setS = useCallback((received) => {
-        const next = withPendingMbps(received);
+        const next = withPendingPrefs(received);
         // When the backend measured elapsed, so the timer can run on between polls.
         next.received_at = Date.now();
         cachedState = next;
@@ -671,18 +703,18 @@ function App() {
         .map((key) => ({ data: key === "preset_custom" ? "custom" : key, label: t(key) }));
     const custom = s.prefs.quality === "custom";
     const [minMbps, maxMbps] = s.custom_mbps_range || [2, 50];
-    const changeCustomMbps = (value) => {
-        pendingMbps = value;
-        setS(s);
-        clearTimeout(sliderTimer);
-        sliderTimer = setTimeout(() => setCustomMbps(value).then((saved) => {
-            // Stored, and no newer value since: the backend's number is right again.
-            if (pendingMbps === value && saved?.prefs?.custom_mbps === value) pendingMbps = null;
-            setS(saved);
-        }).catch(() => {
-            pendingMbps = null;
-        }), SLIDER_SAVE_MS);
-    };
+    const changeCustomMbps = (value) => saveSlider("custom_mbps", setCustomMbps, value, s, setS);
+    // HDR brightness, for KMS on Deck OLED's panel or an external HDR display: the
+    // game's peak brightness in 10-nit steps up to the display's own peak, and the
+    // paper white as a toggle: off 203 (the default), on "Keep Highlights" 300. The
+    // peak shown is the one in use (the display's when unset).
+    const showHdr = method === "kms" && s.hdr_settings;
+    const [minPeak, maxPeak] = s.hdr_peak_range || [400, 1000];
+    const peakValue = "hdr_peak" in pendingPrefs ? pendingPrefs.hdr_peak : (s.hdr_peak ?? maxPeak);
+    const [paperWhiteOff, paperWhiteOn] = s.paper_whites || [203, 300];
+    const keepHighlights = s.prefs.hdr_paper_white === paperWhiteOn;
+    const showRgb10Retry = idle && method === "kms" && s.hdr_rgb10_failed;
+    const changeHdrPeak = (value) => saveSlider("hdr_peak", setHdrPeak, value, s, setS);
     const toggle = () => {
         if (Date.now() - panelShownAt < RECORD_GUARD_MS) return undefined;
         watchRecording();
@@ -714,6 +746,14 @@ function App() {
                 t(capturing ? "action.stop" : "action.start")))),
             s.error ? Row(h(Note, { color: ERROR_COLOR }, t(`err.${s.error}`) + (s.error_detail ? ` (${s.error_detail})` : ""))) : null,
             s.error ? Row(h(DFL.ButtonItem, { layout: "below", onClick: () => clearError().then(setS) }, t("dismiss"))) : null,
+            // 10-bit HDR input failed: recordings use NV12 until this retry. Under the
+            // start button, where it is seen before recording; hidden while capturing.
+            showRgb10Retry ? Row(h(Note, { color: ERROR_COLOR }, t("hdr.rgb10.failed"))) : null,
+            showRgb10Retry ? Row(h(Slot, { id: "rgb10Retry" }, h(DFL.ButtonItem, {
+                layout: "below",
+                description: t("hdr.rgb10.retry.note"),
+                onClick: () => retryRgb10().then(setS).catch(() => {}),
+            }, t("hdr.rgb10.retry")))) : null,
         ))),
         h(DFL.PanelSection, { title: t("section.settings") },
             Row(h(Slot, { id: "method", menu: true }, h(DFL.DropdownItem, {
@@ -733,6 +773,27 @@ function App() {
                 disabled: !idle,
                 checked: s.prefs.kms_original_color,
                 onChange: (enabled) => setKmsOriginalColor(enabled).then(setS),
+            }))) : null,
+            showHdr ? Row(h(Slot, { id: "hdrPeak" }, h(DFL.SliderField, {
+                label: t("hdr.peak"),
+                bottomSeparator: "none",
+                disabled: !idle,
+                value: peakValue,
+                min: minPeak,
+                max: maxPeak,
+                step: 10,
+                showValue: true,
+                valueSuffix: " nits",
+                onChange: changeHdrPeak,
+            }))) : null,
+            showHdr ? Row(h(OptionNote, { divider: true, disabled: !idle }, t("hdr.note"))) : null,
+            showHdr ? Row(h(Slot, { id: "hdrPaperWhite" }, h(DFL.ToggleField, {
+                label: t("hdr.white"),
+                description: t(keepHighlights ? "hdr.white.300.note" : "hdr.white.203.note"),
+                bottomSeparator: "standard",
+                disabled: !idle,
+                checked: keepHighlights,
+                onChange: (enabled) => choose(setHdrPaperWhite, enabled ? paperWhiteOn : paperWhiteOff),
             }))) : null,
             Row(h(Slot, { id: "quality", menu: true }, h(DFL.DropdownItem, {
                 label: t("quality"),
